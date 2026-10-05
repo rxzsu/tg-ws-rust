@@ -98,6 +98,16 @@ impl RawWebSocket {
         path: &str,
         secure: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_sni(host, domain, path, secure, None).await
+    }
+
+    pub async fn connect_with_sni(
+        host: &str,
+        domain: &str,
+        path: &str,
+        secure: bool,
+        sni: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let stream = if secure {
             let addr = format!("{}:443", host);
             let tcp = TcpStream::connect(addr).await?;
@@ -111,7 +121,8 @@ impl RawWebSocket {
                 .with_no_client_auth();
 
             let connector = TlsConnector::from(Arc::new(config));
-            let server_name = ServerName::try_from(domain.to_string())
+            let tls_sni = sni.unwrap_or(domain);
+            let server_name = ServerName::try_from(tls_sni.to_string())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
             let tls = connector.connect(server_name, tcp).await?;

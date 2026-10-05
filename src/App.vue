@@ -19,8 +19,27 @@ import {
   ArrowUp,
   ArrowDown,
   ChevronUp,
-  ChevronDown
+  ChevronDown,
+  Globe,
+  Wifi,
+  Download,
+  AlertCircle
 } from 'lucide-vue-next'
+
+interface DcTestResult {
+  dc: string
+  host: string
+  ok: boolean
+  latency_ms: number
+  message: string
+}
+
+interface UpdateCheckResult {
+  has_update: boolean
+  current_version: string
+  latest_version: string
+  release_url: string
+}
 
 interface ProxyConfig {
   host: string
@@ -71,6 +90,65 @@ function showToast(message: string) {
 
 const userDomainsInput = ref('')
 const workerDomainsInput = ref('')
+const dcRedirectsInput = ref('2: 149.154.167.220, 4: 149.154.167.220')
+
+const isTestingConnectivity = ref(false)
+const testResults = ref<DcTestResult[]>([])
+const showTestModal = ref(false)
+
+const updateInfo = ref<UpdateCheckResult | null>(null)
+const isCheckingUpdate = ref(false)
+
+async function checkForUpdates(manual = false) {
+  isCheckingUpdate.value = true
+  try {
+    const res = await invoke<UpdateCheckResult>('check_updates')
+    updateInfo.value = res
+    if (manual) {
+      if (res.has_update) {
+        showToast(`Доступна новая версия: ${res.latest_version}!`)
+      } else {
+        showToast('У вас установлена самая актуальная версия!')
+      }
+    }
+  } catch (e) {
+    console.error('Update check error:', e)
+    if (manual) showToast('Ошибка при проверке обновлений')
+  } finally {
+    isCheckingUpdate.value = false
+  }
+}
+
+async function runConnectivityTest() {
+  isTestingConnectivity.value = true
+  showTestModal.value = true
+  try {
+    const custom = userDomainsInput.value
+      .split(/[\s,;]+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+    testResults.value = await invoke<DcTestResult[]>('test_connectivity', { customDomains: custom })
+  } catch (e) {
+    console.error('Connectivity test error:', e)
+  } finally {
+    isTestingConnectivity.value = false
+  }
+}
+
+function parseDcRedirects(text: string): Record<number, string> {
+  const result: Record<number, string> = {}
+  const pairs = text.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
+  for (const pair of pairs) {
+    const [dcStr, ip] = pair.split(':')
+    if (dcStr && ip) {
+      const dcNum = parseInt(dcStr.trim(), 10)
+      if (!isNaN(dcNum)) {
+        result[dcNum] = ip.trim()
+      }
+    }
+  }
+  return result
+}
 
 const telemetry = ref<TelemetrySnapshot>({
   connections_total: 0,
@@ -148,6 +226,9 @@ async function fetchStatus() {
     config.value = cfg
     userDomainsInput.value = (cfg.cfproxy_user_domains || []).join(', ')
     workerDomainsInput.value = (cfg.cfproxy_worker_domains || []).join(', ')
+    dcRedirectsInput.value = Object.entries(cfg.dc_redirects || {})
+      .map(([dc, ip]) => `${dc}: ${ip}`)
+      .join(', ')
 
     updateTgLink(cfg)
     autostartActive.value = await isEnabled()
@@ -205,6 +286,8 @@ async function saveSettings() {
       .map(s => s.trim())
       .filter(Boolean)
 
+    config.value.dc_redirects = parseDcRedirects(dcRedirectsInput.value)
+
     await invoke('save_config', { newConfig: config.value })
     updateTgLink(config.value)
     showToast('Настройки успешно применены и сохранены!')
@@ -246,6 +329,7 @@ async function closeApp() {
 
 onMounted(() => {
   fetchStatus()
+  checkForUpdates(false)
   listen<TelemetrySnapshot>('telemetry-update', (event) => {
     if (!isRunning.value) {
       event.payload.connections_active = 0
@@ -329,6 +413,16 @@ onMounted(() => {
               <Settings class="w-4 h-4" />
               <span>Настройки</span>
             </button>
+
+            <button 
+              @click="runConnectivityTest"
+              :disabled="isTestingConnectivity"
+              class="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium text-white/60 hover:text-white hover:bg-white/5 transition border border-white/[0.04] cursor-pointer disabled:opacity-50 mt-2"
+              title="Проверить пинг и доступность DC1–DC5"
+            >
+              <Wifi class="w-4 h-4 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
+              <span>{{ isTestingConnectivity ? 'Проверка...' : 'Тест связности DC' }}</span>
+            </button>
           </nav>
         </div>
 
@@ -348,6 +442,28 @@ onMounted(() => {
 
       <!-- Right Main Content Area -->
       <main class="flex-1 bg-[#16191f] rounded-2xl p-5 border border-white/5 shadow-inner overflow-y-auto">
+        <!-- New Version Update Banner -->
+        <div 
+          v-if="updateInfo && updateInfo.has_update" 
+          class="mb-4 bg-gradient-to-r from-blue-900/40 via-indigo-900/40 to-purple-900/40 border border-blue-500/30 rounded-2xl p-3.5 flex items-center justify-between shadow-lg shadow-blue-950/30 animate-pulse"
+        >
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-xl bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-blue-400">
+              <Download class="w-4 h-4" />
+            </div>
+            <div>
+              <div class="text-xs font-bold text-white">Доступна новая версия {{ updateInfo.latest_version }}!</div>
+              <div class="text-[10px] text-white/50">Текущая версия {{ updateInfo.current_version }}</div>
+            </div>
+          </div>
+          <button 
+            @click="invoke('open_url', { url: updateInfo.release_url })"
+            class="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md transition cursor-pointer"
+          >
+            Скачать
+          </button>
+        </div>
+
         <!-- VIEW 1: УПРАВЛЕНИЕ -->
         <div v-if="activeTab === 'main'" class="space-y-4 max-w-2xl mx-auto">
           <!-- Status Banner Card -->
@@ -548,6 +664,16 @@ onMounted(() => {
                   <span>Случайный</span>
                 </button>
               </div>
+            </div>
+
+            <div>
+              <label class="block text-[11px] text-white/40 mb-1">Целевые IP дата-центров (DC:IP перенаправление)</label>
+              <input 
+                v-model="dcRedirectsInput" 
+                placeholder="2: 149.154.167.220, 4: 149.154.167.220"
+                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
+              />
+              <div class="text-[10px] text-white/30 mt-1">Прямые IP адреса для маршрутизации трафика к серверам Telegram CDN</div>
             </div>
           </div>
 
@@ -889,6 +1015,40 @@ onMounted(() => {
                   />
                 </button>
               </div>
+
+              <!-- Action 1: DC Connectivity Test -->
+              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
+                <div class="pr-3">
+                  <div class="text-xs font-semibold text-white/90">Тест связности дата-центров</div>
+                  <div class="text-[10px] text-white/40 mt-0.5">Проверить отклик и доступность серверов Telegram DC1–DC5</div>
+                </div>
+                <button
+                  type="button"
+                  @click="runConnectivityTest"
+                  :disabled="isTestingConnectivity"
+                  class="px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs font-medium text-white/90 flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
+                >
+                  <Wifi class="w-3.5 h-3.5 text-emerald-400" />
+                  <span>{{ isTestingConnectivity ? 'Тестирование...' : 'Запустить тест' }}</span>
+                </button>
+              </div>
+
+              <!-- Action 2: Update Check -->
+              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
+                <div class="pr-3">
+                  <div class="text-xs font-semibold text-white/90">Обновления программы</div>
+                  <div class="text-[10px] text-white/40 mt-0.5">Текущая версия v0.1.0</div>
+                </div>
+                <button
+                  type="button"
+                  @click="checkForUpdates(true)"
+                  :disabled="isCheckingUpdate"
+                  class="px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs font-medium text-white/90 flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw class="w-3.5 h-3.5 text-blue-400" :class="isCheckingUpdate ? 'animate-spin' : ''" />
+                  <span>{{ isCheckingUpdate ? 'Проверка...' : 'Проверить' }}</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -896,13 +1056,86 @@ onMounted(() => {
           <div class="flex justify-end pt-2">
             <button 
               @click="saveSettings"
-              class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white font-medium text-xs shadow-lg shadow-blue-500/20 transition"
+              class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white font-medium text-xs shadow-lg shadow-blue-500/20 transition cursor-pointer"
             >
               Сохранить настройки
             </button>
           </div>
         </div>
       </main>
+    </div>
+
+    <!-- Connectivity Test Modal Dialog -->
+    <div 
+      v-if="showTestModal" 
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+    >
+      <div class="bg-[#181c24] border border-white/10 rounded-2xl w-full max-w-lg shadow-2xl p-5 space-y-4">
+        <div class="flex items-center justify-between border-b border-white/5 pb-3">
+          <div class="flex items-center gap-2">
+            <Wifi class="w-5 h-5 text-emerald-400" />
+            <h3 class="text-sm font-bold text-white">Доступность дата-центров Telegram</h3>
+          </div>
+          <button @click="showTestModal = false" class="text-white/40 hover:text-white transition cursor-pointer">
+            <X class="w-4 h-4" />
+          </button>
+        </div>
+
+        <div v-if="isTestingConnectivity" class="py-8 flex flex-col items-center justify-center gap-3">
+          <RefreshCw class="w-6 h-6 text-emerald-400 animate-spin" />
+          <span class="text-xs text-white/60">Отправка тестовых WebSocket пакетов к DC1-DC5...</span>
+        </div>
+
+        <div v-else class="space-y-2 max-h-72 overflow-y-auto pr-1">
+          <div 
+            v-for="item in testResults" 
+            :key="item.dc + item.host" 
+            class="flex items-center justify-between p-3 rounded-xl bg-[#13161c] border border-white/5"
+          >
+            <div class="flex items-center gap-3">
+              <div 
+                :class="[
+                  'w-2.5 h-2.5 rounded-full',
+                  item.ok ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)]'
+                ]" 
+              />
+              <div>
+                <div class="text-xs font-bold text-white">{{ item.dc }}</div>
+                <div class="text-[10px] text-white/40 font-mono">{{ item.host }}</div>
+              </div>
+            </div>
+
+            <div class="text-right">
+              <span 
+                :class="[
+                  'px-2 py-0.5 rounded-lg text-[10px] font-mono font-semibold',
+                  item.ok ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                ]"
+              >
+                {{ item.message }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between pt-2 border-t border-white/5">
+          <button 
+            @click="runConnectivityTest" 
+            :disabled="isTestingConnectivity"
+            class="px-3.5 py-1.5 rounded-xl bg-[#222834] hover:bg-[#2b3342] text-xs text-white flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw class="w-3.5 h-3.5" :class="isTestingConnectivity ? 'animate-spin' : ''" />
+            <span>Повторить</span>
+          </button>
+
+          <button 
+            @click="showTestModal = false"
+            class="px-4 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs text-white font-medium shadow-md transition cursor-pointer"
+          >
+            Закрыть
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Floating Toast Notification -->

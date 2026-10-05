@@ -243,26 +243,117 @@ async fn close_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Serialize, Clone)]
+pub struct DcTestResult {
+    pub dc: String,
+    pub host: String,
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub message: String,
+}
+
 #[tauri::command]
-async fn test_connectivity(domains: Vec<String>) -> Result<Vec<(String, bool, String)>, String> {
+async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResult>, String> {
     use tg_ws_proxy_core::raw_websocket::RawWebSocket;
+    let mut targets = Vec::new();
+
+    targets.push(("DC1".to_string(), "kws1.web.telegram.org".to_string()));
+    targets.push(("DC2".to_string(), "kws2.web.telegram.org".to_string()));
+    targets.push(("DC3".to_string(), "kws3.web.telegram.org".to_string()));
+    targets.push(("DC4".to_string(), "kws4.web.telegram.org".to_string()));
+    targets.push(("DC5".to_string(), "kws5.web.telegram.org".to_string()));
+    targets.push(("DC203".to_string(), "kws2.web.telegram.org".to_string()));
+
+    for d in custom_domains {
+        let clean = d.trim().to_string();
+        if !clean.is_empty() {
+            targets.push(("Custom".to_string(), clean));
+        }
+    }
+
+    let mut handles = Vec::new();
+    for (dc, host) in targets {
+        handles.push(tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let connect_fut = RawWebSocket::connect(&host, &host, "/apiws", true);
+            match tokio::time::timeout(std::time::Duration::from_secs(6), connect_fut).await {
+                Ok(Ok(mut ws)) => {
+                    let ms = start.elapsed().as_millis() as u64;
+                    let _ = ws.close().await;
+                    DcTestResult {
+                        dc,
+                        host,
+                        ok: true,
+                        latency_ms: ms,
+                        message: format!("{} ms (101 OK)", ms),
+                    }
+                }
+                Ok(Err(e)) => {
+                    let ms = start.elapsed().as_millis() as u64;
+                    DcTestResult {
+                        dc,
+                        host,
+                        ok: false,
+                        latency_ms: ms,
+                        message: format!("Ошибка: {}", e),
+                    }
+                }
+                Err(_) => {
+                    DcTestResult {
+                        dc,
+                        host,
+                        ok: false,
+                        latency_ms: 6000,
+                        message: "Таймаут (6с)".to_string(),
+                    }
+                }
+            }
+        }));
+    }
+
     let mut results = Vec::new();
-    for d in domains {
-        let domain_clean = d.trim().to_string();
-        if domain_clean.is_empty() { continue; }
-        let start = std::time::Instant::now();
-        match RawWebSocket::connect(&domain_clean, &domain_clean, "/apiws", true).await {
-            Ok(mut ws) => {
-                let ms = start.elapsed().as_millis();
-                let _ = ws.close().await;
-                results.push((domain_clean, true, format!("{} ms (OK)", ms)));
-            }
-            Err(e) => {
-                results.push((domain_clean, false, format!("Ошибка: {}", e)));
-            }
+    for h in handles {
+        if let Ok(res) = h.await {
+            results.push(res);
         }
     }
     Ok(results)
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct UpdateCheckResult {
+    pub has_update: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_url: String,
+}
+
+#[tauri::command]
+async fn check_updates() -> Result<UpdateCheckResult, String> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    match tg_ws_proxy_core::balancer::check_latest_github_release().await {
+        Ok((tag, url)) => {
+            let tag_clean = tag.trim_start_matches('v').trim();
+            let cur_clean = current_version.trim_start_matches('v').trim();
+
+            let has_update = !tag_clean.is_empty() && tag_clean != cur_clean;
+            Ok(UpdateCheckResult {
+                has_update,
+                current_version,
+                latest_version: tag,
+                release_url: url,
+            })
+        }
+        Err(e) => {
+            log::warn!("GitHub update check failed: {:?}", e);
+            Ok(UpdateCheckResult {
+                has_update: false,
+                current_version: current_version.clone(),
+                latest_version: current_version,
+                release_url: "https://github.com/rxzsu/tg-ws-rust/releases".to_string(),
+            })
+        }
+    }
 }
 
 #[tauri::command]
@@ -397,7 +488,8 @@ pub fn run() {
             minimize_window,
             toggle_maximize_window,
             close_window,
-            test_connectivity
+            test_connectivity,
+            check_updates
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

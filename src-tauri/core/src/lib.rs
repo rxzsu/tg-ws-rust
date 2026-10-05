@@ -1,4 +1,6 @@
+pub mod balancer;
 pub mod bridge;
+pub mod cf_h2;
 pub mod config;
 pub mod crypto;
 pub mod fake_tls;
@@ -13,6 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
+use crate::balancer::Balancer;
 use crate::bridge::bridge_ws_reencrypt;
 use crate::config::{get_default_dc_ip, ProxyConfig};
 use crate::crypto::CryptoCtx;
@@ -40,6 +43,9 @@ pub async fn run_server_with_stats(
         pool.warm_up_defaults(!cfg.disable_secure).await;
     }
 
+    let balancer = Arc::new(Balancer::new());
+    balancer.clone().start_background_refresh();
+
     loop {
         let (stream, peer_addr) = tokio::select! {
             res = listener.accept() => {
@@ -61,6 +67,7 @@ pub async fn run_server_with_stats(
         let stats = stats.clone();
         let cfg = cfg.clone();
         let pool = pool.clone();
+        let balancer = balancer.clone();
         let mut conn_shutdown = shutdown_rx.resubscribe();
 
         tokio::spawn(async move {
@@ -69,7 +76,7 @@ pub async fn run_server_with_stats(
             let label = peer_addr.to_string();
 
             tokio::select! {
-                res = handle_connection(stream, secret, stats.clone(), cfg, pool, label.clone()) => {
+                res = handle_connection(stream, secret, stats.clone(), cfg, pool, balancer, label.clone()) => {
                     if let Err(e) = res {
                         warn!("[{}] connection error: {:?}", label, e);
                     }
@@ -95,6 +102,7 @@ async fn handle_connection(
     stats: Arc<Stats>,
     cfg: Arc<ProxyConfig>,
     pool: Arc<ConnectionPool>,
+    balancer: Arc<Balancer>,
     label: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = stream.set_nodelay(true);
@@ -186,7 +194,12 @@ async fn handle_connection(
         }
 
         info!("[{}] Connecting to upstream WS {}", label, domain);
-        match RawWebSocket::connect(domain, domain, "/apiws", !cfg.disable_secure).await {
+        let conn_res = match RawWebSocket::connect(domain, domain, "/apiws", !cfg.disable_secure).await {
+            Ok(s) => Ok(s),
+            Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+        };
+
+        match conn_res {
             Ok(mut socket) => {
                 if let Err(e) = socket.send(&relay_init).await {
                     warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
@@ -202,14 +215,15 @@ async fn handle_connection(
         }
     }
 
-    // 2. Fallback: CF Worker / CF Domains if direct WS failed
+    // 2. Fallback: CF Worker / CF Domains / Dynamic Balancer if direct WS failed
     if ws.is_none() && cfg.fallback_cfproxy {
         let fallback_ip = get_default_dc_ip(dc_id, is_test);
 
         // Try CF Worker domains
         if let Some(ip) = fallback_ip {
             for worker_domain in &cfg.cfproxy_worker_domains {
-                let path = format!("/apiws?dst={}&dc={}", ip, hs.dc_id);
+                let media_flag = if hs.is_media { 1 } else { 0 };
+                let path = format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, media_flag);
                 info!("[{}] Fallback CF Worker: {} -> {}", label, worker_domain, path);
                 if let Ok(mut worker_ws) = RawWebSocket::connect(worker_domain, worker_domain, &path, !cfg.disable_secure).await {
                     if worker_ws.send(&relay_init).await.is_ok() {
@@ -225,12 +239,39 @@ async fn handle_connection(
         if ws.is_none() {
             for cf_domain in &cfg.cfproxy_user_domains {
                 info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
-                if let Ok(mut cf_ws) = RawWebSocket::connect(cf_domain, cf_domain, "/apiws", !cfg.disable_secure).await {
+                let conn = match RawWebSocket::connect(cf_domain, cf_domain, "/apiws", !cfg.disable_secure).await {
+                    Ok(s) => Ok(s),
+                    Err(_) => RawWebSocket::connect_with_sni(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+                };
+                if let Ok(mut cf_ws) = conn {
                     if cf_ws.send(&relay_init).await.is_ok() {
                         stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ws = Some(cf_ws);
                         break;
                     }
+                }
+            }
+        }
+
+        // Try Dynamic Balancer Domains
+        if ws.is_none() {
+            let balancer_domains = balancer.get_domains_for_dc(dc_id).await;
+            for b_domain in balancer_domains {
+                let host = format!("kws{}.{}", dc_id, b_domain);
+                info!("[{}] Fallback Balancer Domain: {}", label, host);
+                let conn = match RawWebSocket::connect(&host, &host, "/apiws", !cfg.disable_secure).await {
+                    Ok(s) => Ok(s),
+                    Err(_) => RawWebSocket::connect_with_sni(&host, &host, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+                };
+
+                if let Ok(mut b_ws) = conn {
+                    if b_ws.send(&relay_init).await.is_ok() {
+                        stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ws = Some(b_ws);
+                        break;
+                    }
+                } else {
+                    balancer.rotate_domain_for_dc(dc_id).await;
                 }
             }
         }
