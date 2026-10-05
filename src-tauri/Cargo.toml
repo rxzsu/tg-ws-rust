@@ -1,0 +1,30 @@
+[package]
+name = "tg-ws-proxy-gui"
+version = "0.1.0"
+description = "Telegram Desktop WebSocket Proxy GUI"
+authors = ["Flowseal"]
+license = "MIT"
+repository = "https://github.com/Flowseal/tg-ws-proxy"
+edition = "2024"
+rust-version = "1.95.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "tg_ws_proxy_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.1", features = ["tray-icon"] }
+tauri-plugin-log = "2"
+tg-ws-proxy-core = { path = "./core" }
+tokio = { version = "1.43", features = ["full"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-autostart = "2"
