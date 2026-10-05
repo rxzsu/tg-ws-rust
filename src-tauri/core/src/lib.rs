@@ -16,10 +16,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
 use crate::balancer::Balancer;
-use crate::bridge::bridge_ws_reencrypt;
+use crate::bridge::{bridge_tcp_fallback, bridge_ws_reencrypt};
 use crate::config::{get_default_dc_ip, ProxyConfig};
 use crate::crypto::CryptoCtx;
-use crate::fake_tls::{build_server_hello, verify_client_hello, TLS_RECORD_HANDSHAKE};
+use crate::fake_tls::{
+    build_server_hello, proxy_to_masking_domain, verify_client_hello, ClientReader, ClientWriter,
+    FakeTlsReader, FakeTlsWriter, TLS_RECORD_HANDSHAKE,
+};
 use crate::handshake::{generate_relay_init, try_handshake};
 use crate::pool::ConnectionPool;
 use crate::raw_websocket::RawWebSocket;
@@ -39,6 +42,7 @@ pub async fn run_server_with_stats(
     let secret = Arc::new(secret_bytes);
     let cfg = Arc::new(config);
     let pool = Arc::new(ConnectionPool::new(cfg.pool_size.max(1)));
+    pool.clone().start_cleanup_task();
     if cfg.pool_size > 0 {
         pool.warm_up_defaults(!cfg.disable_secure).await;
     }
@@ -107,43 +111,105 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = stream.set_nodelay(true);
 
+    let mut label = label;
+
+    // 1. PROXY Protocol v1 support
+    if cfg.proxy_protocol {
+        let mut pp_buf = Vec::with_capacity(108);
+        let mut byte = [0u8; 1];
+        let read_res = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pp_buf.len() < 108 {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return false;
+                }
+                pp_buf.push(byte[0]);
+                if pp_buf.ends_with(b"\r\n") {
+                    return true;
+                }
+            }
+            false
+        }).await;
+
+        if let Ok(true) = read_res {
+            if let Ok(pp_str) = std::str::from_utf8(&pp_buf) {
+                let trimmed = pp_str.trim();
+                if trimmed.starts_with("PROXY ") {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        label = format!("{}:{}", parts[2], parts[4]);
+                        tracing::debug!("[{}] PROXY protocol v1 client: {}", label, trimmed);
+                    }
+                }
+            }
+        }
+    }
+
     let mut first_byte = [0u8; 1];
     stream.read_exact(&mut first_byte).await?;
 
-    let handshake_buf = if first_byte[0] == TLS_RECORD_HANDSHAKE && !cfg.fake_tls_domain.is_empty() {
-        // Fake TLS client hello
-        let mut rest_hdr = [0u8; 4];
-        stream.read_exact(&mut rest_hdr).await?;
-        let record_len = u16::from_be_bytes([rest_hdr[2], rest_hdr[3]]) as usize;
-        let mut record_body = vec![0u8; record_len];
-        stream.read_exact(&mut record_body).await?;
+    let (handshake_buf, client_reader, client_writer) = if !cfg.fake_tls_domain.is_empty() {
+        if first_byte[0] == TLS_RECORD_HANDSHAKE {
+            // Fake TLS client hello
+            let mut rest_hdr = [0u8; 4];
+            stream.read_exact(&mut rest_hdr).await?;
+            let record_len = u16::from_be_bytes([rest_hdr[2], rest_hdr[3]]) as usize;
+            let mut record_body = vec![0u8; record_len];
+            stream.read_exact(&mut record_body).await?;
 
-        let mut client_hello = Vec::new();
-        client_hello.push(first_byte[0]);
-        client_hello.extend_from_slice(&rest_hdr);
-        client_hello.extend_from_slice(&record_body);
+            let mut client_hello = Vec::new();
+            client_hello.push(first_byte[0]);
+            client_hello.extend_from_slice(&rest_hdr);
+            client_hello.extend_from_slice(&record_body);
 
-        let tls_res = match verify_client_hello(&client_hello, &secret) {
-            Some(res) => res,
-            None => return Err("Fake TLS verification failed".into()),
-        };
+            let tls_res = match verify_client_hello(&client_hello, &secret) {
+                Some(res) => res,
+                None => {
+                    info!(
+                        "[{}] Fake TLS verification failed -> proxying to real site {}",
+                        label, cfg.fake_tls_domain
+                    );
+                    stats.connections_bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = proxy_to_masking_domain(stream, &client_hello, &cfg.fake_tls_domain, &label).await;
+                    return Ok(());
+                }
+            };
 
-        let sh = build_server_hello(&secret, &tls_res.client_random, &tls_res.session_id);
-        tokio::io::AsyncWriteExt::write_all(&mut stream, &sh).await?;
+            let sh = build_server_hello(&secret, &tls_res.client_random, &tls_res.session_id);
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &sh).await?;
+            tokio::io::AsyncWriteExt::flush(&mut stream).await?;
 
-        // Read inner obfs2 handshake from TLS stream
-        let mut inner_buf = [0u8; 64];
-        let mut rec_hdr = [0u8; 5];
-        stream.read_exact(&mut rec_hdr).await?;
-        stream.read_exact(&mut inner_buf).await?;
-        inner_buf
+            let (cr, cw) = stream.into_split();
+            let mut clt_r = ClientReader::FakeTls(FakeTlsReader::new(cr));
+            let clt_w = ClientWriter::FakeTls(FakeTlsWriter::new(cw));
+
+            // Read inner obfs2 handshake from TLS stream
+            let mut inner_buf = [0u8; 64];
+            clt_r.read_exact(&mut inner_buf).await?;
+            (inner_buf, clt_r, clt_w)
+        } else {
+            // Non-TLS byte on Fake TLS domain -> HTTP 301 Moved Permanently redirect
+            tracing::debug!(
+                "[{}] Non-TLS byte 0x{:02X} -> 301 redirect to {}",
+                label, first_byte[0], cfg.fake_tls_domain
+            );
+            let redirect = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                cfg.fake_tls_domain
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, redirect.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+            return Ok(());
+        }
     } else {
         let mut rest = [0u8; 63];
         stream.read_exact(&mut rest).await?;
         let mut full = [0u8; 64];
         full[0] = first_byte[0];
         full[1..].copy_from_slice(&rest);
-        full
+
+        let (cr, cw) = stream.into_split();
+        (full, ClientReader::Plain(cr), ClientWriter::Plain(cw))
     };
 
     let hs = match try_handshake(&handshake_buf, &secret) {
@@ -277,6 +343,29 @@ async fn handle_connection(
         }
     }
 
+    // 3. Direct TCP Fallback to Telegram DC IP if all WebSockets failed
+    if ws.is_none() {
+        if let Some(target_ip) = get_default_dc_ip(dc_id, is_test) {
+            info!("[{}] All WebSockets failed, engaging Direct TCP Fallback to {}:443", label, target_ip);
+            let tcp_conn = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                TcpStream::connect(format!("{}:443", target_ip))
+            ).await;
+
+            if let Ok(Ok(mut remote_stream)) = tcp_conn {
+                let _ = remote_stream.set_nodelay(true);
+                use tokio::io::AsyncWriteExt;
+                if remote_stream.write_all(&relay_init).await.is_ok() && remote_stream.flush().await.is_ok() {
+                    stats.connections_tcp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!("[{}] Direct TCP Fallback connected to {}:443", label, target_ip);
+                    return bridge_tcp_fallback(client_reader, client_writer, remote_stream, ctx, stats, label).await;
+                }
+            } else {
+                warn!("[{}] Direct TCP Fallback connection to {}:443 failed", label, target_ip);
+            }
+        }
+    }
+
     let ws = match ws {
         Some(w) => w,
         None => {
@@ -285,7 +374,7 @@ async fn handle_connection(
     };
 
     let splitter = Some(MsgSplitter::new(&relay_init, hs.proto_int));
-    bridge_ws_reencrypt(stream, ws, ctx, splitter, stats, label).await?;
+    bridge_ws_reencrypt(client_reader, client_writer, ws, ctx, splitter, stats, label).await?;
 
     Ok(())
 }

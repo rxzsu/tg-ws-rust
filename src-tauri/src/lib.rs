@@ -357,6 +357,11 @@ async fn check_updates() -> Result<UpdateCheckResult, String> {
 }
 
 #[tauri::command]
+fn get_link_host(host: String) -> String {
+    tg_ws_proxy_core::config::get_link_host(&host)
+}
+
+#[tauri::command]
 async fn get_telemetry(state: State<'_, Arc<AppState>>) -> Result<TelemetrySnapshot, String> {
     Ok(state.stats.snapshot(0.0, 0.0))
 }
@@ -484,6 +489,7 @@ pub fn run() {
             start_proxy,
             stop_proxy,
             get_telemetry,
+            get_link_host,
             open_url,
             minimize_window,
             toggle_maximize_window,

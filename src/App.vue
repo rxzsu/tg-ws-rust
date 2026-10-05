@@ -191,15 +191,22 @@ function formatBytes(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
-function generateSecret() {
+async function generateSecret() {
   const arr = new Uint8Array(16)
   window.crypto.getRandomValues(arr)
   config.value.secret = Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
-  updateTgLink(config.value)
+  await updateTgLink(config.value)
 }
 
-function updateTgLink(cfg: ProxyConfig) {
-  const host = cfg.host === '0.0.0.0' ? '127.0.0.1' : cfg.host
+async function updateTgLink(cfg: ProxyConfig) {
+  let host = cfg.host
+  if (host === '0.0.0.0') {
+    try {
+      host = await invoke<string>('get_link_host', { host: cfg.host })
+    } catch {
+      host = '127.0.0.1'
+    }
+  }
   let cleanSecret = cfg.secret.trim()
   // Only slice 'dd' or 'ee' prefix if length is greater than 32 (meaning prefix was already prepended)
   if ((cleanSecret.startsWith('dd') || cleanSecret.startsWith('ee')) && cleanSecret.length > 32) {
@@ -230,7 +237,7 @@ async function fetchStatus() {
       .map(([dc, ip]) => `${dc}: ${ip}`)
       .join(', ')
 
-    updateTgLink(cfg)
+    await updateTgLink(cfg)
     autostartActive.value = await isEnabled()
   } catch (err) {
     console.error('Failed to load status:', err)
@@ -267,7 +274,7 @@ async function toggleProxy() {
 
   try {
     await invoke<string>('start_proxy')
-    updateTgLink(config.value)
+    await updateTgLink(config.value)
     isRunning.value = true
   } catch (err) {
     console.error('Error starting proxy:', err)
@@ -289,7 +296,7 @@ async function saveSettings() {
     config.value.dc_redirects = parseDcRedirects(dcRedirectsInput.value)
 
     await invoke('save_config', { newConfig: config.value })
-    updateTgLink(config.value)
+    await updateTgLink(config.value)
     showToast('Настройки успешно применены и сохранены!')
   } catch (err) {
     console.error('Error saving settings:', err)

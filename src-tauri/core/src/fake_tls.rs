@@ -135,3 +135,186 @@ pub fn wrap_tls_records(data: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+pub struct FakeTlsReader<R> {
+    reader: R,
+    buf: Vec<u8>,
+    cursor: usize,
+}
+
+impl<R: AsyncReadExt + Unpin> FakeTlsReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.cursor >= self.buf.len() {
+            self.buf.clear();
+            self.cursor = 0;
+            let mut hdr = [0u8; 5];
+            match self.reader.read_exact(&mut hdr).await {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
+                Err(e) => return Err(e),
+            }
+            let rtype = hdr[0];
+            let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            if rtype == TLS_RECORD_CCS {
+                let mut sink = vec![0u8; rec_len];
+                self.reader.read_exact(&mut sink).await?;
+                continue;
+            }
+            if rtype != TLS_RECORD_APPDATA {
+                return Ok(0);
+            }
+            self.buf.resize(rec_len, 0);
+            self.reader.read_exact(&mut self.buf).await?;
+        }
+        let available = self.buf.len() - self.cursor;
+        let to_copy = available.min(out.len());
+        out[..to_copy].copy_from_slice(&self.buf[self.cursor..self.cursor + to_copy]);
+        self.cursor += to_copy;
+        Ok(to_copy)
+    }
+
+    pub async fn read_exact(&mut self, mut out: &mut [u8]) -> std::io::Result<()> {
+        while !out.is_empty() {
+            let n = self.read(out).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            out = &mut out[n..];
+        }
+        Ok(())
+    }
+}
+
+pub struct FakeTlsWriter<W> {
+    writer: W,
+}
+
+impl<W: AsyncWriteExt + Unpin> FakeTlsWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self { writer }
+    }
+
+    pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let wrapped = wrap_tls_records(data);
+        self.writer.write_all(&wrapped).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.writer.shutdown().await
+    }
+}
+
+pub enum ClientReader {
+    Plain(tokio::net::tcp::OwnedReadHalf),
+    FakeTls(FakeTlsReader<tokio::net::tcp::OwnedReadHalf>),
+}
+
+impl ClientReader {
+    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(r) => r.read(buf).await,
+            Self::FakeTls(r) => r.read(buf).await,
+        }
+    }
+
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(r) => r.read_exact(buf).await.map(|_| ()),
+            Self::FakeTls(r) => r.read_exact(buf).await,
+        }
+    }
+}
+
+pub enum ClientWriter {
+    Plain(tokio::net::tcp::OwnedWriteHalf),
+    FakeTls(FakeTlsWriter<tokio::net::tcp::OwnedWriteHalf>),
+}
+
+impl ClientWriter {
+    pub async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => {
+                w.write_all(buf).await?;
+                w.flush().await?;
+                Ok(())
+            }
+            Self::FakeTls(w) => w.write_all(buf).await,
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.shutdown().await,
+            Self::FakeTls(w) => w.shutdown().await,
+        }
+    }
+}
+
+pub async fn proxy_to_masking_domain(
+    client_stream: TcpStream,
+    initial_data: &[u8],
+    domain: &str,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let target = format!("{}:443", domain);
+    tracing::info!("[{}] Proxying probe to masking domain: {}", label, target);
+
+    let upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&target),
+    ).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!("[{}] Failed to connect to masking domain {}: {:?}", label, target, e);
+            return Err(e.into());
+        }
+        Err(_) => {
+            tracing::warn!("[{}] Timeout connecting to masking domain {}", label, target);
+            return Err("Masking domain connect timeout".into());
+        }
+    };
+
+    let mut upstream = upstream;
+    let _ = upstream.set_nodelay(true);
+
+    if !initial_data.is_empty() {
+        upstream.write_all(initial_data).await?;
+        upstream.flush().await?;
+    }
+
+    let (mut cr, mut cw) = client_stream.into_split();
+    let (mut ur, mut uw) = upstream.into_split();
+
+    let c_to_u = async move {
+        let _ = tokio::io::copy(&mut cr, &mut uw).await;
+        let _ = uw.shutdown().await;
+    };
+    let u_to_c = async move {
+        let _ = tokio::io::copy(&mut ur, &mut cw).await;
+        let _ = cw.shutdown().await;
+    };
+
+    tokio::select! {
+        _ = c_to_u => {},
+        _ = u_to_c => {},
+    }
+
+    Ok(())
+}
+
