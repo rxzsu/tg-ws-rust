@@ -47,7 +47,21 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'v__VERSION__'
-          releaseBody: 'Release v__VERSION__ of Telegram WebSocket Proxy GUI with high-performance Rust core.'
+          releaseBody: |
+            ### 🚀 Telegram WebSocket Proxy GUI v__VERSION__
+
+            #### Что нового в v0.2.0:
+            - **DPI Anti-Probe & Masking Domain Proxying**: Прозрачное проксирование неавторизованных Fake TLS запросов на реальный сайт (`fake_tls_domain:443`) и HTTP 301 Moved Permanently для открытых HTTP-проверок.
+            - **Direct TCP Fallback**: Аварийное переключение на прямое соединение с Telegram DC через AES-CTR мост при тотальной блокировке WebSocket-шлюзов.
+            - **Динамический балансировщик Cloudflare**: Фоновое автообновление пула CDN-доменов из GitHub и балансировка по дата-центрам.
+            - **Domain Fronting & SNI маскировка**: Поддержка подмены SNI при коннекте к серверам Telegram.
+            - **Cloudflare Worker Fallback**: Маршрутизация через пользовательские Cloudflare Workers (`/apiws?dst=...&dc=...&media=...`).
+            - **PROXY Protocol v1**: Поддержка работы за обратными прокси и балансировщиками (Nginx, HAProxy).
+            - **Тест связности (Connectivity Test)**: Встроенная проверка доступности и замер пинга до всех дата-центров Telegram (DC1–DC5, DC203).
+            - **Ротация и очистка сокетов пула (TTL 120s)**: Предотвращение отправки данных в заснувшие или разорванные CDN-сокеты.
+            - **Определение локального LAN IP**: Автоматическое определение реального адреса адаптера для удобного подключения по Wi-Fi при `0.0.0.0`.
+            - **Встроенная проверка обновлений**: Оповещение о новых версиях через GitHub Releases API.
+            - **Новая официальная иконка приложения**: Обновлённый дизайн и иконки всех форматов.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

@@ -1,10 +1,10 @@
 [package]
 name = "tg-ws-proxy-gui"
-version = "0.1.0"
+version = "0.2.0"
 description = "Telegram Desktop WebSocket Proxy GUI"
-authors = ["Flowseal"]
+authors = ["nsvl"]
 license = "MIT"
-repository = "https://github.com/Flowseal/tg-ws-proxy"
+repository = "https://github.com/rxzsu/tg-ws-rust"
 edition = "2024"
 rust-version = "1.95.0"
 
