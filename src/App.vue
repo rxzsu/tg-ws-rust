@@ -380,9 +380,11 @@ onMounted(() => {
         <div class="space-y-6">
           <!-- Logo / App Name -->
           <div class="flex items-center gap-3">
-            <div class="w-9 h-9 rounded-xl bg-[#202530] border border-white/5 flex items-center justify-center shadow-md">
-              <ShieldCheck class="w-5 h-5 text-white/90" />
-            </div>
+            <img 
+              src="/Telegram_logo.svg.webp" 
+              class="w-9 h-9 rounded-xl object-contain drop-shadow-[0_4px_12px_rgba(0,136,204,0.3)]" 
+              alt="TG WS Proxy" 
+            />
             <h1 class="font-bold text-sm text-white tracking-wide">TG WS Proxy</h1>
           </div>
 
