@@ -74,11 +74,10 @@ pub async fn bridge_ws_reencrypt(
             }
         }
 
-        if let Some(ref mut sp) = splitter {
-            let flushed = sp.flush();
-            if !flushed.is_empty() {
-                let _ = ws_writer.send_batch(&flushed).await;
-            }
+        if let Some(ref mut sp) = splitter
+            && let Some(tail) = sp.flush()
+        {
+            let _ = ws_writer.send(&tail).await;
         }
         let _ = ws_writer.close().await;
     };

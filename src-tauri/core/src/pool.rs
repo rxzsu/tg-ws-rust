@@ -4,10 +4,6 @@ use std::time::{Duration, Instant};
 use crate::raw_websocket::RawWebSocket;
 use tracing::{debug, info};
 
-pub fn default_max_age() -> Duration {
-    Duration::from_secs(120)
-}
-
 /// One pooled domain queue: connections plus their creation timestamps.
 type DomainQueue = Arc<Mutex<Vec<(RawWebSocket, Instant)>>>;
 
@@ -128,44 +124,6 @@ impl ConnectionPool {
             match RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, io_buf).await {
                 Ok(ws) => this.put(domain, ws).await,
                 Err(e) => debug!("Pool replenish error for {}: {:?}", domain, e),
-            }
-        });
-    }
-
-    pub async fn warm_up(&self, domain: &str, path: &str, secure: bool, count: usize) {
-        let domain_str = domain.to_string();
-        let path_str = path.to_string();
-        let max = self.max_per_key;
-        let io_buf = self.io_buf;
-        let this_domains = self.domains.clone();
-
-        tokio::spawn(async move {
-            for _ in 0..count.min(max) {
-                match RawWebSocket::connect_with_buf(&domain_str, &domain_str, &path_str, secure, io_buf).await {
-                    Ok(ws) => {
-                        let q = {
-                            let mut map = match this_domains.write() {
-                                Ok(m) => m,
-                                Err(_) => break,
-                            };
-                            map.entry(domain_str.clone())
-                                .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
-                                .clone()
-                        };
-                        let mut list = match q.lock() {
-                            Ok(l) => l,
-                            Err(_) => break,
-                        };
-                        if list.len() < max {
-                            list.push((ws, Instant::now()));
-                            info!("Warmed up connection to {}", domain_str);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Warm-up error for {}: {:?}", domain_str, e);
-                        break;
-                    }
-                }
             }
         });
     }

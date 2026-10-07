@@ -4,24 +4,21 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { enable, isEnabled, disable } from '@tauri-apps/plugin-autostart'
 import LogsView from './components/LogsView.vue'
-import { 
-  Play, 
-  Square, 
-  Copy, 
-  Check, 
-  Settings, 
-  ShieldCheck, 
-  Activity, 
-  ExternalLink,
+import TelemetryGrid from './components/TelemetryGrid.vue'
+import TgLinkCard from './components/TgLinkCard.vue'
+import DcTestModal from './components/DcTestModal.vue'
+import {
+  Play,
+  Square,
+  Check,
+  Settings,
+  Activity,
   Minus,
   Maximize2,
   X,
   RefreshCw,
-  ArrowUp,
-  ArrowDown,
   ChevronUp,
   ChevronDown,
-  Globe,
   Wifi,
   Download,
   AlertCircle,
@@ -79,7 +76,6 @@ interface TelemetrySnapshot {
 
 const isRunning = ref(false)
 const tgLink = ref('')
-const copied = ref(false)
 const toast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
 const errorToast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
 const activeTab = ref<'main' | 'settings' | 'logs'>('main')
@@ -201,14 +197,6 @@ const config = ref<ProxyConfig>({
   log_max_mb: 20,
   pool_max_age_secs: 120,
 })
-
-function formatBytes(bytes: number): string {
-  if (!bytes || bytes <= 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
-}
 
 async function generateSecret() {
   const arr = new Uint8Array(16)
@@ -343,25 +331,6 @@ async function saveSettings() {
       isRunning.value = await invoke<boolean>('is_running')
     } catch { /* ignore */ }
     showError(formatInvokeError(err))
-  }
-}
-
-async function copyLink() {
-  if (!tgLink.value) return
-  await navigator.clipboard.writeText(tgLink.value)
-  copied.value = true
-  setTimeout(() => {
-    copied.value = false
-  }, 2000)
-}
-
-async function openTelegram() {
-  if (!tgLink.value) return
-  try {
-    await invoke('open_url', { url: tgLink.value })
-  } catch (err) {
-    console.error('Failed to open tg link via backend:', err)
-    window.open(tgLink.value.replace('tg://proxy?', 'https://t.me/proxy?'), '_blank')
   }
 }
 
@@ -604,119 +573,10 @@ onMounted(() => {
           </div>
 
           <!-- 4 Telemetry Metrics Grid -->
-          <div class="grid grid-cols-4 gap-3">
-            <!-- Metric 1: Upload -->
-            <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-              <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-                <span>Отдача</span>
-                <div class="w-6 h-6 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
-                  <ArrowUp class="w-3.5 h-3.5" />
-                </div>
-              </div>
-              <div class="text-lg font-bold text-white font-mono tracking-tight">
-                {{ telemetry.speed_up_kbps.toFixed(1) }} <span class="text-xs font-normal text-white/40">Кб/с</span>
-              </div>
-              <div class="text-[10px] text-white/40 font-mono">
-                Всего: {{ formatBytes(telemetry.bytes_up) }}
-              </div>
-            </div>
-
-            <!-- Metric 2: Download -->
-            <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-              <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-                <span>Загрузка</span>
-                <div class="w-6 h-6 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
-                  <ArrowDown class="w-3.5 h-3.5" />
-                </div>
-              </div>
-              <div class="text-lg font-bold text-emerald-400 font-mono tracking-tight">
-                {{ telemetry.speed_down_kbps.toFixed(1) }} <span class="text-xs font-normal text-white/40">Кб/с</span>
-              </div>
-              <div class="text-[10px] text-white/40 font-mono">
-                Всего: {{ formatBytes(telemetry.bytes_down) }}
-              </div>
-            </div>
-
-            <!-- Metric 3: Active Sockets -->
-            <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-              <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-                <span>Активные сокеты</span>
-                <div class="w-6 h-6 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
-                  <Activity class="w-3.5 h-3.5" />
-                </div>
-              </div>
-              <div class="text-lg font-bold text-white font-mono tracking-tight">
-                {{ telemetry.connections_active }}
-              </div>
-              <div class="text-[10px] text-white/40">
-                Всего сессий: {{ telemetry.connections_total }}
-              </div>
-            </div>
-
-            <!-- Metric 4: Transport -->
-            <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-              <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-                <span>Транспорт</span>
-                <div class="w-6 h-6 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 font-bold text-[10px] font-mono">
-                  CF
-                </div>
-              </div>
-              <div class="text-base font-bold text-purple-300 font-mono tracking-tight">
-                WS + H2
-              </div>
-              <div class="text-[10px] text-white/40 truncate">
-                Cloudflare CDN
-              </div>
-            </div>
-          </div>
+          <TelemetryGrid :telemetry="telemetry" />
 
           <!-- Telegram Connection Link Card -->
-          <div class="bg-gradient-to-b from-[#1b2230] via-[#161b25] to-[#13161f] border border-blue-500/25 rounded-2xl p-5 space-y-4 shadow-xl shadow-blue-950/20">
-            <div class="flex items-start justify-between">
-              <div>
-                <h3 class="text-sm font-bold text-white flex items-center gap-2">
-                  <span>Ссылка для подключения Telegram</span>
-                  <span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30 font-mono">MTProto</span>
-                </h3>
-                <p class="text-xs text-white/50 mt-1">
-                  Нажмите «Открыть в Telegram» для мгновенного добавления прокси в клиент или скопируйте ссылку.
-                </p>
-              </div>
-            </div>
-
-            <!-- Link Bar with Buttons -->
-            <div class="flex items-center gap-2 bg-[#0e1117] p-2 rounded-xl border border-white/5 shadow-inner">
-              <input 
-                readonly
-                :value="tgLink"
-                class="bg-transparent flex-1 text-xs font-mono text-white/80 outline-none px-3 select-all truncate selection:bg-blue-600/40"
-              />
-              
-              <!-- Copy button -->
-              <button 
-                @click="copyLink"
-                :class="[
-                  'flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition duration-200 active:scale-95 cursor-pointer',
-                  copied 
-                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' 
-                    : 'bg-[#1c222e] hover:bg-[#252c3c] text-white/70 hover:text-white border border-white/5'
-                ]"
-                title="Скопировать ссылку"
-              >
-                <component :is="copied ? Check : Copy" class="w-3.5 h-3.5" :class="copied ? 'text-emerald-400 stroke-[3]' : ''" />
-                <span>{{ copied ? 'Скопировано!' : 'Копировать' }}</span>
-              </button>
-
-              <!-- Open in Telegram button -->
-              <button 
-                @click="openTelegram"
-                class="flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-blue-600 via-blue-500 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/30 hover:shadow-blue-500/40 active:scale-95 transition-all duration-200 cursor-pointer"
-              >
-                <ExternalLink class="w-3.5 h-3.5 text-white" />
-                <span>Открыть в Telegram</span>
-              </button>
-            </div>
-          </div>
+          <TgLinkCard :link="tgLink" />
         </div>
 
         <!-- VIEW 2: ПОЛНЫЕ НАСТРОЙКИ (С красивыми кастомными чекбоксами) -->
@@ -1188,77 +1048,13 @@ onMounted(() => {
     </div>
 
     <!-- Connectivity Test Modal Dialog -->
-    <div 
-      v-if="showTestModal" 
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
-    >
-      <div class="bg-[#181c24] border border-white/10 rounded-2xl w-full max-w-lg shadow-2xl p-5 space-y-4">
-        <div class="flex items-center justify-between border-b border-white/5 pb-3">
-          <div class="flex items-center gap-2">
-            <Wifi class="w-5 h-5 text-emerald-400" />
-            <h3 class="text-sm font-bold text-white">Доступность дата-центров Telegram</h3>
-          </div>
-          <button @click="showTestModal = false" class="text-white/40 hover:text-white transition cursor-pointer">
-            <X class="w-4 h-4" />
-          </button>
-        </div>
-
-        <div v-if="isTestingConnectivity" class="py-8 flex flex-col items-center justify-center gap-3">
-          <RefreshCw class="w-6 h-6 text-emerald-400 animate-spin" />
-          <span class="text-xs text-white/60">Отправка тестовых WebSocket пакетов к DC1-DC5...</span>
-        </div>
-
-        <div v-else class="space-y-2 max-h-72 overflow-y-auto pr-1">
-          <div 
-            v-for="item in testResults" 
-            :key="item.dc + item.host" 
-            class="flex items-center justify-between p-3 rounded-xl bg-[#13161c] border border-white/5"
-          >
-            <div class="flex items-center gap-3">
-              <div 
-                :class="[
-                  'w-2.5 h-2.5 rounded-full',
-                  item.ok ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)]'
-                ]" 
-              />
-              <div>
-                <div class="text-xs font-bold text-white">{{ item.dc }}</div>
-                <div class="text-[10px] text-white/40 font-mono">{{ item.host }}</div>
-              </div>
-            </div>
-
-            <div class="text-right">
-              <span 
-                :class="[
-                  'px-2 py-0.5 rounded-lg text-[10px] font-mono font-semibold',
-                  item.ok ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-                ]"
-              >
-                {{ item.message }}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <div class="flex items-center justify-between pt-2 border-t border-white/5">
-          <button 
-            @click="runConnectivityTest" 
-            :disabled="isTestingConnectivity"
-            class="px-3.5 py-1.5 rounded-xl bg-[#222834] hover:bg-[#2b3342] text-xs text-white flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
-          >
-            <RefreshCw class="w-3.5 h-3.5" :class="isTestingConnectivity ? 'animate-spin' : ''" />
-            <span>Повторить</span>
-          </button>
-
-          <button 
-            @click="showTestModal = false"
-            class="px-4 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs text-white font-medium shadow-md transition cursor-pointer"
-          >
-            Закрыть
-          </button>
-        </div>
-      </div>
-    </div>
+    <DcTestModal
+      :show="showTestModal"
+      :testing="isTestingConnectivity"
+      :results="testResults"
+      @close="showTestModal = false"
+      @retry="runConnectivityTest"
+    />
 
     <!-- Floating Toast Notification -->
     <transition

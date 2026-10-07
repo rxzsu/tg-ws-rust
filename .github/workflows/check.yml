@@ -1,0 +1,43 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Clippy (core, deny warnings)
+        run: cargo clippy -p tg-ws-proxy-core --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: Clippy (gui, deny warnings)
+        run: cargo clippy -p tg-ws-proxy-gui --lib -- -D warnings
+        working-directory: src-tauri
+
+      - name: Tests (core)
+        run: cargo test -p tg-ws-proxy-core
+        working-directory: src-tauri
+
+      - name: Frontend build
+        run: bun install && bun run build

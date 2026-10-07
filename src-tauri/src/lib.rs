@@ -11,7 +11,7 @@ use tauri::{
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tg_ws_proxy_core::config::ProxyConfig;
 use tg_ws_proxy_core::logging as core_logging;
-use tg_ws_proxy_core::stats::{Stats, TelemetrySnapshot};
+use tg_ws_proxy_core::stats::Stats;
 use tokio::sync::Mutex;
 
 struct AppState {
@@ -33,18 +33,18 @@ fn get_config_path(app: &AppHandle) -> PathBuf {
 
 fn load_saved_config(app: &AppHandle) -> ProxyConfig {
     let path = get_config_path(app);
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
-            return cfg;
-        }
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content)
+    {
+        return cfg;
     }
     // Check fallback location in APPDATA/TgWsProxy/config.json
     if let Ok(appdata) = std::env::var("APPDATA") {
         let legacy_path = PathBuf::from(appdata).join("TgWsProxy").join("config.json");
-        if let Ok(content) = fs::read_to_string(&legacy_path) {
-            if let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content) {
-                return cfg;
-            }
+        if let Ok(content) = fs::read_to_string(&legacy_path)
+            && let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content)
+        {
+            return cfg;
         }
     }
     ProxyConfig::default()
@@ -359,11 +359,6 @@ async fn restart_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Resul
 }
 
 #[tauri::command]
-async fn get_tg_link(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(current_tg_link(state.inner()).await)
-}
-
-#[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
@@ -408,14 +403,14 @@ pub struct DcTestResult {
 #[tauri::command]
 async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResult>, String> {
     use tg_ws_proxy_core::raw_websocket::RawWebSocket;
-    let mut targets = Vec::new();
-
-    targets.push(("DC1".to_string(), "kws1.web.telegram.org".to_string()));
-    targets.push(("DC2".to_string(), "kws2.web.telegram.org".to_string()));
-    targets.push(("DC3".to_string(), "kws3.web.telegram.org".to_string()));
-    targets.push(("DC4".to_string(), "kws4.web.telegram.org".to_string()));
-    targets.push(("DC5".to_string(), "kws5.web.telegram.org".to_string()));
-    targets.push(("DC203".to_string(), "kws2.web.telegram.org".to_string()));
+    let mut targets = vec![
+        ("DC1".to_string(), "kws1.web.telegram.org".to_string()),
+        ("DC2".to_string(), "kws2.web.telegram.org".to_string()),
+        ("DC3".to_string(), "kws3.web.telegram.org".to_string()),
+        ("DC4".to_string(), "kws4.web.telegram.org".to_string()),
+        ("DC5".to_string(), "kws5.web.telegram.org".to_string()),
+        ("DC203".to_string(), "kws2.web.telegram.org".to_string()),
+    ];
 
     for d in custom_domains {
         let clean = d.trim().to_string();
@@ -512,11 +507,6 @@ async fn check_updates() -> Result<UpdateCheckResult, String> {
 #[tauri::command]
 fn get_link_host(host: String) -> String {
     tg_ws_proxy_core::config::get_link_host(&host)
-}
-
-#[tauri::command]
-async fn get_telemetry(state: State<'_, Arc<AppState>>) -> Result<TelemetrySnapshot, String> {
-    Ok(state.stats.snapshot(0.0, 0.0))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -769,9 +759,7 @@ pub fn run() {
             start_proxy,
             stop_proxy,
             restart_proxy,
-            get_tg_link,
             get_app_version,
-            get_telemetry,
             get_link_host,
             get_recent_logs,
             open_log_file,

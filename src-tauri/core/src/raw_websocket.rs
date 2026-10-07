@@ -249,7 +249,7 @@ impl WsWriter {
         self.writer.flush().await
     }
 
-    pub async fn send_batch(&mut self, parts: &[Vec<u8>]) -> std::io::Result<()> {
+    pub async fn send_batch(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         if self.closed {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "WebSocket closed"));
         }
