@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance Telegram MTProto WebSocket Proxy Core in Rust"
 authors = ["nsvl"]
 license = "MIT"
@@ -28,5 +28,13 @@ thiserror = "2.0"
 http = "1.2"
 httparse = "1.9"
 h2 = "0.4"
+socket2 = "0.5"
 hex = "0.4"
 base64 = "0.23"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false

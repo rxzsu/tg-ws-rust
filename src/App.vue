@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { enable, isEnabled, disable } from '@tauri-apps/plugin-autostart'
+import LogsView from './components/LogsView.vue'
 import { 
   Play, 
   Square, 
@@ -24,9 +25,7 @@ import {
   Wifi,
   Download,
   AlertCircle,
-  FileText,
-  Trash2,
-  FolderOpen
+  FileText
 } from 'lucide-vue-next'
 
 interface DcTestResult {
@@ -63,6 +62,7 @@ interface ProxyConfig {
   force_test_dc: boolean
   verbose: boolean
   log_max_mb: number
+  pool_max_age_secs: number
 }
 
 interface TelemetrySnapshot {
@@ -116,40 +116,6 @@ const showTestModal = ref(false)
 
 const updateInfo = ref<UpdateCheckResult | null>(null)
 const isCheckingUpdate = ref(false)
-
-// Live bridge logs (file-backed, censored)
-const logLines = ref<string[]>([])
-const isLoadingLogs = ref(false)
-let logsTimer: number | null = null
-
-async function fetchLogs() {
-  isLoadingLogs.value = true
-  try {
-    logLines.value = await invoke<string[]>('get_recent_logs')
-  } catch (e) {
-    console.error('Failed to load logs:', e)
-  } finally {
-    isLoadingLogs.value = false
-  }
-}
-
-async function openLogsFile() {
-  try {
-    await invoke('open_log_file')
-  } catch (e) {
-    showError(formatInvokeError(e))
-  }
-}
-
-async function clearLogs() {
-  try {
-    await invoke('clear_logs')
-    logLines.value = []
-    showToast('Логи очищены!')
-  } catch (e) {
-    showError(formatInvokeError(e))
-  }
-}
 
 async function checkForUpdates(manual = false) {
   isCheckingUpdate.value = true
@@ -233,6 +199,7 @@ const config = ref<ProxyConfig>({
   force_test_dc: false,
   verbose: false,
   log_max_mb: 20,
+  pool_max_age_secs: 120,
 })
 
 function formatBytes(bytes: number): string {
@@ -429,10 +396,6 @@ onMounted(() => {
     }
     telemetry.value = event.payload
   })
-  // Poll logs while the logs tab is open
-  logsTimer = window.setInterval(() => {
-    if (activeTab.value === 'logs') fetchLogs()
-  }, 2000)
 })
 </script>
 
@@ -512,7 +475,7 @@ onMounted(() => {
             </button>
 
             <button 
-              @click="activeTab = 'logs'; fetchLogs()"
+              @click="activeTab = 'logs'"
               :class="[
                 'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
                 activeTab === 'logs' 
@@ -1216,39 +1179,11 @@ onMounted(() => {
         </div>
 
         <!-- VIEW 3: ЛОГИ МОСТА -->
-        <div v-else-if="activeTab === 'logs'" class="space-y-4 max-w-2xl mx-auto pb-4">
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="flex items-center justify-between">
-              <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Живой лог моста (файл, домены скрыты)</div>
-              <button
-                @click="fetchLogs"
-                :disabled="isLoadingLogs"
-                class="p-1.5 rounded-lg bg-[#202530] hover:bg-[#2a3040] text-white/70 transition border border-white/5 cursor-pointer disabled:opacity-50"
-                title="Обновить логи"
-              >
-                <RefreshCw class="w-3.5 h-3.5" :class="isLoadingLogs ? 'animate-spin' : ''" />
-              </button>
-            </div>
-            <pre class="bg-[#0e1117] border border-white/5 rounded-xl p-3 text-[10px] font-mono text-white/70 h-72 overflow-y-auto whitespace-pre-wrap break-all">{{ logLines.length ? logLines.join('\n') : 'Логов пока нет. Запустите мост.' }}</pre>
-            <div class="text-[10px] text-white/30">Приватные Cloudflare-домены и воркеры в файле маскируются (***), лог можно безопасно прикладывать к Issue.</div>
-            <div class="flex items-center justify-end gap-2">
-              <button
-                @click="clearLogs"
-                class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs text-white/80 transition border border-white/5 cursor-pointer"
-              >
-                <Trash2 class="w-3.5 h-3.5 text-rose-400" />
-                <span>Очистить</span>
-              </button>
-              <button
-                @click="openLogsFile"
-                class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs text-white font-medium shadow-md transition cursor-pointer"
-              >
-                <FolderOpen class="w-3.5 h-3.5" />
-                <span>Открыть в Блокноте</span>
-              </button>
-            </div>
-          </div>
-        </div>
+        <LogsView
+          v-else-if="activeTab === 'logs'"
+          @notify="showToast"
+          @notify-error="showError"
+        />
       </main>
     </div>
 

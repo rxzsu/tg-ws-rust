@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-gui"
-version = "0.2.0"
+version = "0.3.0"
 description = "Telegram Desktop WebSocket Proxy GUI"
 authors = ["nsvl"]
 license = "MIT"
@@ -31,4 +31,13 @@ tokio = { version = "1.43", features = ["full"] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
+
+# Release tuning (this manifest is the workspace root on CI, where the
+# parent workspace below does not exist). LTO + single codegen unit for
+# speed, strip for binary size.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
 

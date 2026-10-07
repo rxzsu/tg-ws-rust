@@ -17,6 +17,28 @@ pub const OP_PONG: u8 = 0xA;
 
 pub const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
+/// Shared TLS client config, built once and reused by every upstream
+/// connection. Sharing matters: rustls keeps the session-ticket store
+/// inside `ClientConfig`, so a fresh config per connect (as before) meant
+/// a full TLS handshake every time and re-cloned ~150 root certs.
+/// With a shared config, repeat connects to the same DC can resume
+/// sessions (1-RTT / abbreviated handshake).
+static TLS_CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+
+fn tls_config() -> Arc<ClientConfig> {
+    TLS_CONFIG
+        .get_or_init(|| {
+            let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
+
 pub enum WsStream {
     Plain(TcpStream),
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
@@ -98,7 +120,17 @@ impl RawWebSocket {
         path: &str,
         secure: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_with_sni(host, domain, path, secure, None).await
+        Self::connect_with_sni(host, domain, path, secure, None, crate::net::clamp_io_buf(262144)).await
+    }
+
+    pub async fn connect_with_buf(
+        host: &str,
+        domain: &str,
+        path: &str,
+        secure: bool,
+        io_buf: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_sni(host, domain, path, secure, None, io_buf).await
     }
 
     pub async fn connect_with_sni(
@@ -107,20 +139,13 @@ impl RawWebSocket {
         path: &str,
         secure: bool,
         sni: Option<&str>,
+        io_buf: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let stream = if secure {
-            let addr = format!("{}:443", host);
-            let tcp = TcpStream::connect(addr).await?;
+            let tcp = crate::net::tcp_connect(host, 443, io_buf).await?;
             let _ = tcp.set_nodelay(true);
 
-            let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-            let config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-
-            let connector = TlsConnector::from(Arc::new(config));
+            let connector = TlsConnector::from(tls_config());
             let tls_sni = sni.unwrap_or(domain);
             let server_name = ServerName::try_from(tls_sni.to_string())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -128,8 +153,7 @@ impl RawWebSocket {
             let tls = connector.connect(server_name, tcp).await?;
             WsStream::Tls(tls)
         } else {
-            let addr = format!("{}:80", host);
-            let tcp = TcpStream::connect(addr).await?;
+            let tcp = crate::net::tcp_connect(host, 80, io_buf).await?;
             let _ = tcp.set_nodelay(true);
             WsStream::Plain(tcp)
         };

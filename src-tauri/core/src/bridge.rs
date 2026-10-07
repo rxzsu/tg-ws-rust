@@ -17,8 +17,11 @@ pub async fn bridge_ws_reencrypt(
     mut splitter: Option<MsgSplitter>,
     stats: Arc<Stats>,
     label: String,
+    io_buf: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws_reader, mut ws_writer) = ws.split();
+    // Single allocation sized from config instead of a hardcoded 64 KB.
+    let buf_size = crate::net::clamp_io_buf(io_buf);
 
     let mut clt_dec = ctx.clt_dec;
     let mut clt_enc = ctx.clt_enc;
@@ -32,7 +35,7 @@ pub async fn bridge_ws_reencrypt(
 
     // Direct Upload Pipeline: Client -> Decrypt & Re-encrypt -> WS
     let upload_task = async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = match client_reader.read(&mut buf).await {
                 Ok(0) => break,
@@ -117,8 +120,10 @@ pub async fn bridge_tcp_fallback(
     ctx: CryptoCtx,
     stats: Arc<Stats>,
     label: String,
+    io_buf: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut remote_reader, mut remote_writer) = remote_stream.into_split();
+    let buf_size = crate::net::clamp_io_buf(io_buf);
 
     let mut clt_dec = ctx.clt_dec;
     let mut clt_enc = ctx.clt_enc;
@@ -132,7 +137,7 @@ pub async fn bridge_tcp_fallback(
 
     // Client -> Decrypt (clt_dec) -> Encrypt (tg_enc) -> Remote TCP
     let upload_task = async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = match client_reader.read(&mut buf).await {
                 Ok(0) => break,
@@ -156,7 +161,7 @@ pub async fn bridge_tcp_fallback(
     // Remote TCP -> Decrypt (tg_dec) -> Encrypt (clt_enc) -> Client
     let download_task = async move {
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = match remote_reader.read(&mut buf).await {
                 Ok(0) => break,

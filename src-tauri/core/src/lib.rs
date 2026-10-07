@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod fake_tls;
 pub mod handshake;
 pub mod logging;
+pub mod net;
 pub mod pool;
 pub mod raw_websocket;
 pub mod splitter;
@@ -13,7 +14,7 @@ pub mod stats;
 
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
 use crate::balancer::Balancer;
@@ -60,7 +61,7 @@ pub async fn run_server_with_stats(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = match TcpListener::bind(&addr).await {
+    let listener = match crate::net::bind_listener(&config.host, config.port).await {
         Ok(l) => l,
         Err(e) => {
             let msg = diagnose_bind_error(&e, &config.host, config.port);
@@ -73,7 +74,11 @@ pub async fn run_server_with_stats(
     let secret_bytes = hex::decode(&config.secret).unwrap_or_else(|_| vec![0u8; 16]);
     let secret = Arc::new(secret_bytes);
     let cfg = Arc::new(config);
-    let pool = Arc::new(ConnectionPool::new(cfg.pool_size.max(1)));
+    let pool = Arc::new(ConnectionPool::new(
+        cfg.pool_size.max(1),
+        crate::net::clamp_io_buf(cfg.buffer_size),
+        cfg.pool_max_age_secs,
+    ));
     pool.clone().start_cleanup_task();
     if cfg.pool_size > 0 {
         pool.warm_up_defaults(!cfg.disable_secure).await;
@@ -105,6 +110,16 @@ pub async fn run_server_with_stats(
         let pool = pool.clone();
         let balancer = balancer.clone();
         let mut conn_shutdown = shutdown_rx.resubscribe();
+
+        // Apply kernel socket buffers from config (best effort).
+        let io_buf = crate::net::clamp_io_buf(cfg.buffer_size);
+        let stream = match crate::net::tune_accepted(stream, io_buf) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[{}] socket tuning failed, dropping connection: {:?}", peer_addr, e);
+                continue;
+            }
+        };
 
         tokio::spawn(async move {
             stats.inc_total();
@@ -267,6 +282,8 @@ async fn handle_connection(
     let relay_init = generate_relay_init(&hs.proto_tag, dc_idx);
     let ctx = CryptoCtx::new(&hs.dec_prekey_and_iv, &secret, &relay_init);
 
+    let io_buf = crate::net::clamp_io_buf(cfg.buffer_size);
+
     // 1. Try WebSocket Domains with connection pooling & background replenishment
     let domains = crate::config::ws_domains(dc_id, hs.is_media);
     let mut ws: Option<RawWebSocket> = None;
@@ -275,14 +292,8 @@ async fn handle_connection(
         // Pool check
         if let Some(mut pooled) = pool.get(domain).await {
             // Auto-replenish pool in background so next client connection also gets 0ms latency
-            let pool_bg = pool.clone();
-            let domain_bg = domain.to_string();
-            let secure_bg = !cfg.disable_secure;
-            tokio::spawn(async move {
-                if let Ok(new_ws) = RawWebSocket::connect(&domain_bg, &domain_bg, "/apiws", secure_bg).await {
-                    pool_bg.put(domain_bg, new_ws).await;
-                }
-            });
+            // (bounded: replenish() skips when the queue is already full).
+            pool.replenish(domain.clone(), !cfg.disable_secure).await;
 
             if pooled.send(&relay_init).await.is_ok() {
                 stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -292,9 +303,9 @@ async fn handle_connection(
         }
 
         info!("[{}] Connecting to upstream WS {}", label, domain);
-        let conn_res = match RawWebSocket::connect(domain, domain, "/apiws", !cfg.disable_secure).await {
+        let conn_res = match RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await {
             Ok(s) => Ok(s),
-            Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+            Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
         };
 
         match conn_res {
@@ -323,7 +334,7 @@ async fn handle_connection(
                 let media_flag = if hs.is_media { 1 } else { 0 };
                 let path = format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, media_flag);
                 info!("[{}] Fallback CF Worker: {} -> {}", label, worker_domain, path);
-                if let Ok(mut worker_ws) = RawWebSocket::connect(worker_domain, worker_domain, &path, !cfg.disable_secure).await {
+                if let Ok(mut worker_ws) = RawWebSocket::connect_with_buf(worker_domain, worker_domain, &path, !cfg.disable_secure, io_buf).await {
                     if worker_ws.send(&relay_init).await.is_ok() {
                         stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         ws = Some(worker_ws);
@@ -337,9 +348,9 @@ async fn handle_connection(
         if ws.is_none() {
             for cf_domain in &cfg.cfproxy_user_domains {
                 info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
-                let conn = match RawWebSocket::connect(cf_domain, cf_domain, "/apiws", !cfg.disable_secure).await {
+                let conn = match RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf).await {
                     Ok(s) => Ok(s),
-                    Err(_) => RawWebSocket::connect_with_sni(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+                    Err(_) => RawWebSocket::connect_with_sni(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
                 };
                 if let Ok(mut cf_ws) = conn {
                     if cf_ws.send(&relay_init).await.is_ok() {
@@ -357,9 +368,9 @@ async fn handle_connection(
             for b_domain in balancer_domains {
                 let host = format!("kws{}.{}", dc_id, b_domain);
                 info!("[{}] Fallback Balancer Domain: {}", label, host);
-                let conn = match RawWebSocket::connect(&host, &host, "/apiws", !cfg.disable_secure).await {
+                let conn = match RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf).await {
                     Ok(s) => Ok(s),
-                    Err(_) => RawWebSocket::connect_with_sni(&host, &host, "/apiws", !cfg.disable_secure, Some("sprinthost.ru")).await,
+                    Err(_) => RawWebSocket::connect_with_sni(&host, &host, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
                 };
 
                 if let Ok(mut b_ws) = conn {
@@ -381,16 +392,15 @@ async fn handle_connection(
             info!("[{}] All WebSockets failed, engaging Direct TCP Fallback to {}:443", label, target_ip);
             let tcp_conn = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                TcpStream::connect(format!("{}:443", target_ip))
+                crate::net::tcp_connect(target_ip, 443, io_buf)
             ).await;
 
             if let Ok(Ok(mut remote_stream)) = tcp_conn {
-                let _ = remote_stream.set_nodelay(true);
                 use tokio::io::AsyncWriteExt;
                 if remote_stream.write_all(&relay_init).await.is_ok() && remote_stream.flush().await.is_ok() {
                     stats.connections_tcp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     info!("[{}] Direct TCP Fallback connected to {}:443", label, target_ip);
-                    return bridge_tcp_fallback(client_reader, client_writer, remote_stream, ctx, stats, label).await;
+                    return bridge_tcp_fallback(client_reader, client_writer, remote_stream, ctx, stats, label, io_buf).await;
                 }
             } else {
                 warn!("[{}] Direct TCP Fallback connection to {}:443 failed", label, target_ip);
@@ -406,7 +416,7 @@ async fn handle_connection(
     };
 
     let splitter = Some(MsgSplitter::new(&relay_init, hs.proto_int));
-    bridge_ws_reencrypt(client_reader, client_writer, ws, ctx, splitter, stats, label).await?;
+    bridge_ws_reencrypt(client_reader, client_writer, ws, ctx, splitter, stats, label, io_buf).await?;
 
     Ok(())
 }

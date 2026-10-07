@@ -29,6 +29,12 @@ pub struct ProxyConfig {
     pub force_test_dc: bool,
     pub verbose: bool,
     pub log_max_mb: u32,
+    #[serde(default = "default_pool_max_age_secs")]
+    pub pool_max_age_secs: u64,
+}
+
+fn default_pool_max_age_secs() -> u64 {
+    120
 }
 
 impl Default for ProxyConfig {
@@ -60,6 +66,7 @@ impl Default for ProxyConfig {
             force_test_dc: false,
             verbose: false,
             log_max_mb: 20,
+            pool_max_age_secs: default_pool_max_age_secs(),
         }
     }
 }
@@ -111,6 +118,40 @@ pub fn get_link_host(host: &str) -> String {
         "127.0.0.1".to_string()
     } else {
         host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Configs saved by v0.2.0 lack `pool_max_age_secs` — they must still
+    /// parse (with the default) instead of resetting user settings.
+    #[test]
+    fn legacy_config_without_pool_max_age_parses() {
+        let legacy = r#"{
+            "host": "127.0.0.1",
+            "port": 1443,
+            "secret": "abcd",
+            "dc_redirects": {},
+            "buffer_size": 262144,
+            "pool_size": 4,
+            "fallback_cfproxy": true,
+            "cfproxy_user_domain_enabled": false,
+            "cfproxy_user_domains": [],
+            "cfproxy_worker_enabled": false,
+            "cfproxy_worker_domains": [],
+            "cfproxy_h2_media": true,
+            "disable_secure": false,
+            "fake_tls_domain": "",
+            "proxy_protocol": false,
+            "force_test_dc": false,
+            "verbose": false,
+            "log_max_mb": 20
+        }"#;
+        let cfg: ProxyConfig = serde_json::from_str(legacy).expect("legacy config must parse");
+        assert_eq!(cfg.pool_max_age_secs, default_pool_max_age_secs());
+        assert_eq!(cfg.port, 1443);
     }
 }
 
