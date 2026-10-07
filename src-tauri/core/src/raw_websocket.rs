@@ -41,7 +41,8 @@ fn tls_config() -> Arc<ClientConfig> {
 
 pub enum WsStream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    /// Boxed: the TLS stream is ~1 KB, boxing keeps pool moves pointer-sized.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl tokio::io::AsyncRead for WsStream {
@@ -151,7 +152,7 @@ impl RawWebSocket {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
             let tls = connector.connect(server_name, tcp).await?;
-            WsStream::Tls(tls)
+            WsStream::Tls(Box::new(tls))
         } else {
             let tcp = crate::net::tcp_connect(host, 80, io_buf).await?;
             let _ = tcp.set_nodelay(true);

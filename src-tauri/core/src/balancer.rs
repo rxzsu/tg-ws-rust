@@ -119,11 +119,11 @@ impl Balancer {
     pub fn start_background_refresh(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                if let Ok(domains) = fetch_github_cf_domains().await {
-                    if domains.len() >= 3 {
-                        self.update_domains_list(domains).await;
-                        tracing::info!("Cloudflare balancer domain pool refreshed from GitHub");
-                    }
+                if let Ok(domains) = fetch_github_cf_domains().await
+                    && domains.len() >= 3
+                {
+                    self.update_domains_list(domains).await;
+                    tracing::info!("Cloudflare balancer domain pool refreshed from GitHub");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }

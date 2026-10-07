@@ -9,19 +9,25 @@ use crate::splitter::MsgSplitter;
 use crate::stats::Stats;
 use tracing::{debug, info};
 
+/// Optional per-bridge tuning knobs (keeps the bridge signatures small).
+pub struct BridgeOptions {
+    pub splitter: Option<MsgSplitter>,
+    pub io_buf: usize,
+}
+
 pub async fn bridge_ws_reencrypt(
     mut client_reader: ClientReader,
     mut client_writer: ClientWriter,
     ws: RawWebSocket,
     ctx: CryptoCtx,
-    mut splitter: Option<MsgSplitter>,
+    opts: BridgeOptions,
     stats: Arc<Stats>,
     label: String,
-    io_buf: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws_reader, mut ws_writer) = ws.split();
     // Single allocation sized from config instead of a hardcoded 64 KB.
-    let buf_size = crate::net::clamp_io_buf(io_buf);
+    let buf_size = crate::net::clamp_io_buf(opts.io_buf);
+    let mut splitter = opts.splitter;
 
     let mut clt_dec = ctx.clt_dec;
     let mut clt_enc = ctx.clt_enc;
@@ -54,11 +60,11 @@ pub async fn bridge_ws_reencrypt(
 
             if let Some(ref mut sp) = splitter {
                 let parts = sp.split(&buf[..n]);
-                if !parts.is_empty() {
-                    if let Err(e) = ws_writer.send_batch(&parts).await {
-                        debug!("[{}] ws send_batch error: {:?}", label_up, e);
-                        break;
-                    }
+                if !parts.is_empty()
+                    && let Err(e) = ws_writer.send_batch(&parts).await
+                {
+                    debug!("[{}] ws send_batch error: {:?}", label_up, e);
+                    break;
                 }
             } else {
                 if let Err(e) = ws_writer.send(&buf[..n]).await {

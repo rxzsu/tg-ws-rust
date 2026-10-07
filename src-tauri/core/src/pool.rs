@@ -8,13 +8,16 @@ pub fn default_max_age() -> Duration {
     Duration::from_secs(120)
 }
 
+/// One pooled domain queue: connections plus their creation timestamps.
+type DomainQueue = Arc<Mutex<Vec<(RawWebSocket, Instant)>>>;
+
 /// Hot-connection pool with per-domain locks.
 ///
 /// The outer map is guarded by an `RwLock` and each domain queue has its own
 /// `Mutex`, so connections to different Telegram DCs never block each other
 /// (previously a single global async `Mutex` serialized all pool access).
 pub struct ConnectionPool {
-    domains: Arc<RwLock<HashMap<String, Arc<Mutex<Vec<(RawWebSocket, Instant)>>>>>>,
+    domains: Arc<RwLock<HashMap<String, DomainQueue>>>,
     max_per_key: usize,
     io_buf: usize,
     max_age: Duration,
@@ -30,7 +33,7 @@ impl ConnectionPool {
         }
     }
 
-    fn queue_for(&self, domain: &str) -> Arc<Mutex<Vec<(RawWebSocket, Instant)>>> {
+    fn queue_for(&self, domain: &str) -> DomainQueue {
         // Fast path: read lock.
         {
             let map = self.domains.read().expect("pool map poisoned");
@@ -54,7 +57,7 @@ impl ConnectionPool {
                 let max_age = self.max_age;
                 // Snapshot queue handles under a short read lock, then prune
                 // each queue under its own lock without holding the map.
-                let queues: Vec<(String, Arc<Mutex<Vec<(RawWebSocket, Instant)>>>)> = {
+                let queues: Vec<(String, DomainQueue)> = {
                     let map = match self.domains.read() {
                         Ok(m) => m,
                         Err(_) => continue,
@@ -170,8 +173,7 @@ impl ConnectionPool {
     /// Pre-warm one connection per Telegram DC (non-media endpoints cover the
     /// common case; media subdomains fall back to on-demand connect).
     pub async fn warm_up_defaults(&self, secure: bool) {
-        let domains: Arc<RwLock<HashMap<String, Arc<Mutex<Vec<(RawWebSocket, Instant)>>>>>> =
-            self.domains.clone();
+        let domains: Arc<RwLock<HashMap<String, DomainQueue>>> = self.domains.clone();
         let max = self.max_per_key;
         let io_buf = self.io_buf;
         tokio::spawn(async move {

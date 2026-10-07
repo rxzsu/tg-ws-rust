@@ -80,15 +80,15 @@ impl RotatingFile {
 
     fn write_censored(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Rotate *before* writing when the file already exceeds the limit.
-        if let Ok(meta) = self.file.metadata() {
-            if meta.len() >= self.max_bytes {
-                drop(fs::rename(&self.path, self.path.with_extension("log.1")));
-                self.file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&self.path)?;
-            }
+        if let Ok(meta) = self.file.metadata()
+            && meta.len() >= self.max_bytes
+        {
+            drop(fs::rename(&self.path, self.path.with_extension("log.1")));
+            self.file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
         }
         let text = String::from_utf8_lossy(buf);
         let censored = censor_text(&text);
@@ -107,7 +107,7 @@ pub struct LogFileWriter {
 
 impl LogFileWriter {
     pub fn new(path: PathBuf, max_mb: u32) -> io::Result<Self> {
-        let max_bytes = (max_mb.max(1).min(500) as u64) * 1024 * 1024;
+        let max_bytes = (u64::from(max_mb.clamp(1, 500))) * 1024 * 1024;
         Ok(Self {
             inner: Arc::new(Mutex::new(RotatingFile::open(&path, max_bytes)?)),
         })

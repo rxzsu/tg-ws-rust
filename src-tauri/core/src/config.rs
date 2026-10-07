@@ -104,21 +104,19 @@ pub fn ws_domains(dc: i32, is_media: bool) -> Vec<String> {
 }
 
 pub fn get_link_host(host: &str) -> String {
-    if host == "0.0.0.0" {
-        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if socket.connect("8.8.8.8:80").is_ok() {
-                if let Ok(addr) = socket.local_addr() {
-                    let ip = addr.ip().to_string();
-                    if ip != "0.0.0.0" {
-                        return ip;
-                    }
-                }
-            }
-        }
-        "127.0.0.1".to_string()
-    } else {
-        host.to_string()
+    if host != "0.0.0.0" {
+        return host.to_string();
     }
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        let ip = addr.ip().to_string();
+        if ip != "0.0.0.0" {
+            return ip;
+        }
+    }
+    "127.0.0.1".to_string()
 }
 
 #[cfg(test)]
