@@ -27,8 +27,12 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # NOTE: benches are excluded on purpose. On CI `core` is a plain
+      # path-dependency (not a workspace member), so cargo ignores its
+      # dev-dependencies and `criterion` is unresolvable there.
+      # Benches are verified locally via `cargo bench`.
       - name: Clippy (core, deny warnings)
-        run: cargo clippy -p tg-ws-proxy-core --all-targets -- -D warnings
+        run: cargo clippy -p tg-ws-proxy-core --lib --tests -- -D warnings
         working-directory: src-tauri
 
       - name: Clippy (gui, deny warnings)
