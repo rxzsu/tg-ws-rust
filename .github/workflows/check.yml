@@ -27,6 +27,13 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # GUI crate links WebKit on Linux (glib-sys build script needs it).
+      - name: Install dependencies (Ubuntu only)
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          version: 1.0
+
       # NOTE: benches are excluded on purpose. On CI `core` is a plain
       # path-dependency (not a workspace member), so cargo ignores its
       # dev-dependencies and `criterion` is unresolvable there.
