@@ -23,7 +23,10 @@ import {
   Globe,
   Wifi,
   Download,
-  AlertCircle
+  AlertCircle,
+  FileText,
+  Trash2,
+  FolderOpen
 } from 'lucide-vue-next'
 
 interface DcTestResult {
@@ -78,14 +81,29 @@ const isRunning = ref(false)
 const tgLink = ref('')
 const copied = ref(false)
 const toast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
-const activeTab = ref<'main' | 'settings'>('main')
+const errorToast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
+const activeTab = ref<'main' | 'settings' | 'logs'>('main')
 const autostartActive = ref(false)
+const appVersion = ref('0.2.0')
 
 function showToast(message: string) {
   toast.value = { show: true, message }
   setTimeout(() => {
     toast.value.show = false
   }, 2600)
+}
+
+function showError(message: string) {
+  errorToast.value = { show: true, message }
+  setTimeout(() => {
+    errorToast.value.show = false
+  }, 6000)
+}
+
+function formatInvokeError(err: unknown): string {
+  if (typeof err === 'string') return err
+  if (err && typeof err === 'object' && 'message' in err) return String((err as { message: unknown }).message)
+  return String(err)
 }
 
 const userDomainsInput = ref('')
@@ -98,6 +116,40 @@ const showTestModal = ref(false)
 
 const updateInfo = ref<UpdateCheckResult | null>(null)
 const isCheckingUpdate = ref(false)
+
+// Live bridge logs (file-backed, censored)
+const logLines = ref<string[]>([])
+const isLoadingLogs = ref(false)
+let logsTimer: number | null = null
+
+async function fetchLogs() {
+  isLoadingLogs.value = true
+  try {
+    logLines.value = await invoke<string[]>('get_recent_logs')
+  } catch (e) {
+    console.error('Failed to load logs:', e)
+  } finally {
+    isLoadingLogs.value = false
+  }
+}
+
+async function openLogsFile() {
+  try {
+    await invoke('open_log_file')
+  } catch (e) {
+    showError(formatInvokeError(e))
+  }
+}
+
+async function clearLogs() {
+  try {
+    await invoke('clear_logs')
+    logLines.value = []
+    showToast('Логи очищены!')
+  } catch (e) {
+    showError(formatInvokeError(e))
+  }
+}
 
 async function checkForUpdates(manual = false) {
   isCheckingUpdate.value = true
@@ -239,6 +291,11 @@ async function fetchStatus() {
 
     await updateTgLink(cfg)
     autostartActive.value = await isEnabled()
+    try {
+      appVersion.value = await invoke<string>('get_app_version')
+    } catch {
+      /* keep default */
+    }
   } catch (err) {
     console.error('Failed to load status:', err)
   }
@@ -268,6 +325,7 @@ async function toggleProxy() {
       telemetry.value.speed_down_kbps = 0
     } catch (err) {
       console.error('Error stopping proxy:', err)
+      showError(formatInvokeError(err))
     }
     return
   }
@@ -278,6 +336,19 @@ async function toggleProxy() {
     isRunning.value = true
   } catch (err) {
     console.error('Error starting proxy:', err)
+    isRunning.value = false
+    showError(formatInvokeError(err))
+  }
+}
+
+async function restartProxy() {
+  try {
+    await invoke<string>('restart_proxy')
+    isRunning.value = true
+    showToast('Прокси перезапущен!')
+  } catch (err) {
+    console.error('Error restarting proxy:', err)
+    showError(formatInvokeError(err))
   }
 }
 
@@ -297,9 +368,14 @@ async function saveSettings() {
 
     await invoke('save_config', { newConfig: config.value })
     await updateTgLink(config.value)
+    isRunning.value = await invoke<boolean>('is_running')
     showToast('Настройки успешно применены и сохранены!')
   } catch (err) {
     console.error('Error saving settings:', err)
+    try {
+      isRunning.value = await invoke<boolean>('is_running')
+    } catch { /* ignore */ }
+    showError(formatInvokeError(err))
   }
 }
 
@@ -337,6 +413,14 @@ async function closeApp() {
 onMounted(() => {
   fetchStatus()
   checkForUpdates(false)
+  listen<string>('proxy-error', (event) => {
+    console.error('Proxy error:', event.payload)
+    isRunning.value = false
+    showError(event.payload)
+  })
+  listen('open-settings', () => {
+    activeTab.value = 'settings'
+  })
   listen<TelemetrySnapshot>('telemetry-update', (event) => {
     if (!isRunning.value) {
       event.payload.connections_active = 0
@@ -345,6 +429,10 @@ onMounted(() => {
     }
     telemetry.value = event.payload
   })
+  // Poll logs while the logs tab is open
+  logsTimer = window.setInterval(() => {
+    if (activeTab.value === 'logs') fetchLogs()
+  }, 2000)
 })
 </script>
 
@@ -424,6 +512,19 @@ onMounted(() => {
             </button>
 
             <button 
+              @click="activeTab = 'logs'; fetchLogs()"
+              :class="[
+                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
+                activeTab === 'logs' 
+                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10' 
+                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
+              ]"
+            >
+              <FileText class="w-4 h-4" />
+              <span>Логи</span>
+            </button>
+
+            <button 
               @click="runConnectivityTest"
               :disabled="isTestingConnectivity"
               class="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium text-white/60 hover:text-white hover:bg-white/5 transition border border-white/[0.04] cursor-pointer disabled:opacity-50 mt-2"
@@ -437,10 +538,13 @@ onMounted(() => {
 
         <!-- Sidebar Bottom Status Indicator -->
         <div class="flex items-center gap-3 p-1">
-          <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)] animate-pulse" />
+          <div :class="[
+            'w-2.5 h-2.5 rounded-full',
+            isRunning ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)] animate-pulse' : 'bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.8)]'
+          ]" />
           <div>
             <div class="text-xs font-semibold text-white/90">
-              Мост активен
+              {{ isRunning ? 'Мост активен' : 'Мост остановлен' }}
             </div>
             <div class="text-[11px] font-mono text-white/40">
               {{ config.host }}:{{ config.port }}
@@ -478,22 +582,61 @@ onMounted(() => {
           <!-- Status Banner Card -->
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-5 shadow-lg flex items-center justify-between">
             <div class="space-y-1">
-              <span class="text-[10px] font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                СЕРВИС ВСЕГДА ВКЛЮЧЕН
+              <span :class="[
+                'text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5',
+                isRunning ? 'text-emerald-400' : 'text-rose-400'
+              ]">
+                <span :class="[
+                  'w-1.5 h-1.5 rounded-full animate-pulse',
+                  isRunning ? 'bg-emerald-400' : 'bg-rose-400'
+                ]"></span>
+                {{ isRunning ? 'СЕРВИС РАБОТАЕТ' : 'СЕРВИС ОСТАНОВЛЕН' }}
               </span>
               <h2 class="text-xl font-bold text-white tracking-tight">
-                Локальный мост активен
+                {{ isRunning ? 'Локальный мост активен' : 'Мост не запущен' }}
               </h2>
               <p class="text-xs text-white/50 max-w-sm leading-relaxed">
                 MTProto WebSocket мост работает в фоновом режиме на {{ config.host }}:{{ config.port }} и маршрутизирует трафик в Telegram.
               </p>
             </div>
 
-            <!-- Always Active Indicator Pill -->
-            <div class="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold shadow-md shadow-emerald-500/10">
-              <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-pulse"></span>
-              <span>Мост работает</span>
+            <!-- Start / Stop / Restart controls -->
+            <div class="flex flex-col items-end gap-2">
+              <div :class="[
+                'flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-xs font-semibold shadow-md',
+                isRunning
+                  ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 shadow-emerald-500/10'
+                  : 'bg-rose-500/10 border border-rose-500/20 text-rose-400 shadow-rose-500/10'
+              ]">
+                <span :class="[
+                  'w-2.5 h-2.5 rounded-full animate-pulse',
+                  isRunning ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)]'
+                ]"></span>
+                <span>{{ isRunning ? 'Мост работает' : 'Мост остановлен' }}</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  @click="restartProxy"
+                  :disabled="!isRunning"
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-white/80 text-xs font-medium transition border border-white/5 cursor-pointer disabled:opacity-40"
+                  title="Перезапустить прокси"
+                >
+                  <RefreshCw class="w-3.5 h-3.5" />
+                  <span>Рестарт</span>
+                </button>
+                <button
+                  @click="toggleProxy"
+                  :class="[
+                    'flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-md transition cursor-pointer active:scale-95',
+                    isRunning
+                      ? 'bg-rose-600/80 hover:bg-rose-500 text-white'
+                      : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                  ]"
+                >
+                  <component :is="isRunning ? Square : Play" class="w-3.5 h-3.5" />
+                  <span>{{ isRunning ? 'Остановить' : 'Запустить' }}</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -614,7 +757,7 @@ onMounted(() => {
         </div>
 
         <!-- VIEW 2: ПОЛНЫЕ НАСТРОЙКИ (С красивыми кастомными чекбоксами) -->
-        <div v-else class="space-y-4 max-w-2xl mx-auto pb-4">
+        <div v-else-if="activeTab === 'settings'" class="space-y-4 max-w-2xl mx-auto pb-4">
           <!-- 1. MTProto Connection Settings -->
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Подключение (MTProto)</div>
@@ -1046,7 +1189,7 @@ onMounted(() => {
               <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
                 <div class="pr-3">
                   <div class="text-xs font-semibold text-white/90">Обновления программы</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Текущая версия v0.1.0</div>
+                  <div class="text-[10px] text-white/40 mt-0.5">Текущая версия v{{ appVersion }}</div>
                 </div>
                 <button
                   type="button"
@@ -1069,6 +1212,41 @@ onMounted(() => {
             >
               Сохранить настройки
             </button>
+          </div>
+        </div>
+
+        <!-- VIEW 3: ЛОГИ МОСТА -->
+        <div v-else-if="activeTab === 'logs'" class="space-y-4 max-w-2xl mx-auto pb-4">
+          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
+            <div class="flex items-center justify-between">
+              <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Живой лог моста (файл, домены скрыты)</div>
+              <button
+                @click="fetchLogs"
+                :disabled="isLoadingLogs"
+                class="p-1.5 rounded-lg bg-[#202530] hover:bg-[#2a3040] text-white/70 transition border border-white/5 cursor-pointer disabled:opacity-50"
+                title="Обновить логи"
+              >
+                <RefreshCw class="w-3.5 h-3.5" :class="isLoadingLogs ? 'animate-spin' : ''" />
+              </button>
+            </div>
+            <pre class="bg-[#0e1117] border border-white/5 rounded-xl p-3 text-[10px] font-mono text-white/70 h-72 overflow-y-auto whitespace-pre-wrap break-all">{{ logLines.length ? logLines.join('\n') : 'Логов пока нет. Запустите мост.' }}</pre>
+            <div class="text-[10px] text-white/30">Приватные Cloudflare-домены и воркеры в файле маскируются (***), лог можно безопасно прикладывать к Issue.</div>
+            <div class="flex items-center justify-end gap-2">
+              <button
+                @click="clearLogs"
+                class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs text-white/80 transition border border-white/5 cursor-pointer"
+              >
+                <Trash2 class="w-3.5 h-3.5 text-rose-400" />
+                <span>Очистить</span>
+              </button>
+              <button
+                @click="openLogsFile"
+                class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs text-white font-medium shadow-md transition cursor-pointer"
+              >
+                <FolderOpen class="w-3.5 h-3.5" />
+                <span>Открыть в Блокноте</span>
+              </button>
+            </div>
           </div>
         </div>
       </main>
@@ -1164,6 +1342,32 @@ onMounted(() => {
           <Check class="w-3.5 h-3.5 stroke-[3]" />
         </div>
         <span class="font-medium text-white/90">{{ toast.message }}</span>
+      </div>
+    </transition>
+
+    <!-- Floating Error Toast (port busy, start failures) -->
+    <transition
+      enter-active-class="transition duration-300 ease-out transform"
+      enter-from-class="opacity-0 translate-y-3 scale-95"
+      enter-to-class="opacity-100 translate-y-0 scale-100"
+      leave-active-class="transition duration-200 ease-in transform"
+      leave-from-class="opacity-100 translate-y-0 scale-100"
+      leave-to-class="opacity-0 translate-y-2 scale-95"
+    >
+      <div 
+        v-if="errorToast.show" 
+        class="fixed bottom-6 left-6 z-50 flex items-center gap-3 px-4 py-2.5 rounded-xl bg-[#241418] border border-rose-500/40 text-white text-xs shadow-2xl shadow-black/80 ring-1 ring-rose-500/20 backdrop-blur-md max-w-md"
+      >
+        <div class="w-5 h-5 shrink-0 rounded-full bg-rose-500/20 flex items-center justify-center text-rose-400">
+          <AlertCircle class="w-3.5 h-3.5" />
+        </div>
+        <span class="font-medium text-white/90 flex-1">{{ errorToast.message }}</span>
+        <button
+          @click="errorToast.show = false; activeTab = 'settings'"
+          class="shrink-0 px-2.5 py-1 rounded-lg bg-rose-600/30 hover:bg-rose-600/50 border border-rose-500/30 text-rose-200 transition cursor-pointer"
+        >
+          Настройки
+        </button>
       </div>
     </transition>
   </div>

@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod fake_tls;
 pub mod handshake;
+pub mod logging;
 pub mod pool;
 pub mod raw_websocket;
 pub mod splitter;
@@ -29,13 +30,44 @@ use crate::raw_websocket::RawWebSocket;
 use crate::splitter::MsgSplitter;
 pub use crate::stats::{Stats, TelemetrySnapshot};
 
+pub fn diagnose_bind_error(err: &std::io::Error, host: &str, port: u16) -> String {
+    let err_kind = err.kind();
+    let raw_os = err.raw_os_error().unwrap_or(0);
+
+    if err_kind == std::io::ErrorKind::AddrInUse || raw_os == 10048 || raw_os == 98 {
+        format!(
+            "Порт {} уже занят другим приложением. Выберите другой порт в настройках.",
+            port
+        )
+    } else if err_kind == std::io::ErrorKind::PermissionDenied || raw_os == 10013 || raw_os == 13 {
+        format!(
+            "Доступ к порту {} заблокирован системой или брандмауэром. Запустите программу от имени администратора или выберите порт выше 1024.",
+            port
+        )
+    } else if err_kind == std::io::ErrorKind::AddrNotAvailable || raw_os == 10049 || raw_os == 99 {
+        format!(
+            "IP-адрес {} недоступен на данном сетевом интерфейсе. Используйте 127.0.0.1 или 0.0.0.0.",
+            host
+        )
+    } else {
+        format!("Не удалось запустить прокси на {}:{}: {}", host, port, err)
+    }
+}
+
 pub async fn run_server_with_stats(
     config: ProxyConfig,
     stats: Arc<Stats>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let msg = diagnose_bind_error(&e, &config.host, config.port);
+            error!("{}", msg);
+            return Err(msg.into());
+        }
+    };
     info!("tg-ws-proxy listening on {}", addr);
 
     let secret_bytes = hex::decode(&config.secret).unwrap_or_else(|_| vec![0u8; 16]);

@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tg_ws_proxy_core::config::ProxyConfig;
+use tg_ws_proxy_core::logging as core_logging;
 use tg_ws_proxy_core::stats::{Stats, TelemetrySnapshot};
 use tokio::sync::Mutex;
 
@@ -55,102 +57,66 @@ fn persist_config(app: &AppHandle, cfg: &ProxyConfig) {
     }
 }
 
-#[tauri::command]
-async fn get_config(state: State<'_, Arc<AppState>>) -> Result<ProxyConfig, String> {
-    let cfg = state.config.lock().await;
-    Ok(cfg.clone())
+pub fn get_log_file_path(app: &AppHandle) -> PathBuf {
+    let mut path = app.path().app_log_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let _ = fs::create_dir_all(&path);
+    path.push("proxy.log");
+    path
 }
 
-#[tauri::command]
-async fn save_config(
-    app: AppHandle,
-    new_config: ProxyConfig,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
-    {
-        let mut cfg = state.config.lock().await;
-        *cfg = new_config.clone();
+pub fn generate_tg_link(cfg: &ProxyConfig) -> String {
+    let host = tg_ws_proxy_core::config::get_link_host(&cfg.host);
+    let mut clean_secret = cfg.secret.trim().to_string();
+    if (clean_secret.starts_with("dd") || clean_secret.starts_with("ee")) && clean_secret.len() > 32 {
+        clean_secret = clean_secret[2..].to_string();
     }
-    persist_config(&app, &new_config);
-
-    // Seamlessly restart proxy bridge with updated settings
-    {
-        let mut tx_guard = state.shutdown_tx.lock().await;
-        if let Some(tx) = tx_guard.take() {
-            let _ = tx.send(());
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
-    {
-        let mut tx_guard = state.shutdown_tx.lock().await;
-        *tx_guard = Some(shutdown_tx);
-    }
-    state.running.store(true, Ordering::SeqCst);
-
-    let proxy_state = state.inner().clone();
-    let stats = proxy_state.stats.clone();
-    let cfg = new_config.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = tg_ws_proxy_core::run_server_with_stats(cfg, stats, shutdown_rx).await {
-            log::error!("Server reload error: {:?}", e);
-        }
-        proxy_state.running.store(false, Ordering::SeqCst);
-    });
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn is_running(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    Ok(state.running.load(Ordering::SeqCst))
-}
-
-#[tauri::command]
-async fn start_proxy(_app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    if state.running.load(Ordering::SeqCst) {
-        return Ok("Already running".into());
-    }
-
-    let cfg = {
-        let guard = state.config.lock().await;
-        guard.clone()
+    let formatted_secret = if !cfg.fake_tls_domain.trim().is_empty() {
+        let domain_hex = hex::encode(cfg.fake_tls_domain.trim().as_bytes());
+        format!("ee{}{}", clean_secret, domain_hex)
+    } else {
+        format!("dd{}", clean_secret)
     };
+    format!("tg://proxy?server={}&port={}&secret={}", host, cfg.port, formatted_secret)
+}
 
-    let proxy_state = state.inner().clone();
-    proxy_state.running.store(true, Ordering::SeqCst);
-    let stats = proxy_state.stats.clone();
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
-    {
-        let mut tx_guard = proxy_state.shutdown_tx.lock().await;
-        *tx_guard = Some(shutdown_tx);
+fn sensitive_domains_of(cfg: &ProxyConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.cfproxy_user_domain_enabled {
+        out.extend(cfg.cfproxy_user_domains.iter().cloned());
     }
+    if cfg.cfproxy_worker_enabled {
+        out.extend(cfg.cfproxy_worker_domains.iter().cloned());
+    }
+    out
+}
 
+async fn current_tg_link(state: &Arc<AppState>) -> String {
+    let cfg = state.config.lock().await;
+    generate_tg_link(&cfg)
+}
+
+/// Spawn the proxy bridge task; caller must have prepared `shutdown_tx`.
+fn spawn_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
+    let stats = proxy_state.stats.clone();
+    let app_err = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = tg_ws_proxy_core::run_server_with_stats(cfg, stats, shutdown_rx).await {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
+        {
+            let mut tx_guard = proxy_state.shutdown_tx.lock().await;
+            *tx_guard = Some(shutdown_tx);
+        }
+        proxy_state.running.store(true, Ordering::SeqCst);
+        if let Err(e) =
+            tg_ws_proxy_core::run_server_with_stats(cfg, stats, shutdown_rx).await
+        {
             log::error!("Server error: {:?}", e);
+            let _ = app_err.emit("proxy-error", e.to_string());
         }
         proxy_state.running.store(false, Ordering::SeqCst);
     });
-
-    Ok("Started".into())
 }
 
-#[tauri::command]
-async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut tx_guard = state.shutdown_tx.lock().await;
-    if let Some(tx) = tx_guard.take() {
-        let _ = tx.send(());
-    }
-    state.running.store(false, Ordering::SeqCst);
-    state.stats.connections_active.store(0, Ordering::SeqCst);
-    Ok(())
-}
-
-#[tauri::command]
-async fn open_url(url: String) -> Result<(), String> {
+fn open_url_native(url: &str) {
     #[cfg(target_os = "windows")]
     {
         use std::ffi::OsStr;
@@ -168,7 +134,7 @@ async fn open_url(url: String) -> Result<(), String> {
             ) -> isize;
         }
 
-        let url_wide: Vec<u16> = OsStr::new(&url).encode_wide().chain(std::iter::once(0)).collect();
+        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(std::iter::once(0)).collect();
         let op_wide: Vec<u16> = OsStr::new("open").encode_wide().chain(std::iter::once(0)).collect();
 
         let res = unsafe {
@@ -187,7 +153,7 @@ async fn open_url(url: String) -> Result<(), String> {
             let alt_url = if url.starts_with("tg://proxy?") {
                 url.replace("tg://proxy?", "https://t.me/proxy?")
             } else {
-                url.clone()
+                url.to_string()
             };
             let alt_wide: Vec<u16> = OsStr::new(&alt_url).encode_wide().chain(std::iter::once(0)).collect();
             let alt_res = unsafe {
@@ -210,9 +176,196 @@ async fn open_url(url: String) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[tauri::command]
+async fn get_config(state: State<'_, Arc<AppState>>) -> Result<ProxyConfig, String> {
+    let cfg = state.config.lock().await;
+    Ok(cfg.clone())
+}
+
+#[tauri::command]
+async fn save_config(
+    app: AppHandle,
+    new_config: ProxyConfig,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().await;
+        *cfg = new_config.clone();
+    }
+    persist_config(&app, &new_config);
+    core_logging::set_sensitive_domains(sensitive_domains_of(&new_config));
+
+    // Seamlessly restart proxy bridge with updated settings.
+    // Stop the old bridge first, then verify the port is actually free
+    // so the user gets a clear "port busy" diagnostic instead of a
+    // silent failure inside the background task.
+    {
+        let mut tx_guard = state.shutdown_tx.lock().await;
+        if let Some(tx) = tx_guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    state.running.store(false, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let addr = format!("{}:{}", new_config.host, new_config.port);
+    if let Err(e) = std::net::TcpListener::bind(&addr) {
+        let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &new_config.host, new_config.port);
+        log::error!("Config apply failed: {}", diag);
+        let _ = app.emit("proxy-error", diag.clone());
+        return Err(diag);
+    }
+
+    let proxy_state = state.inner().clone();
+    spawn_bridge(app, proxy_state, new_config);
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn is_running(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    Ok(state.running.load(Ordering::SeqCst))
+}
+
+#[tauri::command]
+async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Ok("Already running".into());
+    }
+
+    let cfg = {
+        let guard = state.config.lock().await;
+        guard.clone()
+    };
+
+    // Pre-flight check port binding with diagnostic mapping
+    let addr = format!("{}:{}", cfg.host, cfg.port);
+    if let Err(e) = std::net::TcpListener::bind(&addr) {
+        let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &cfg.host, cfg.port);
+        log::error!("Start failed: {}", diag);
+        let _ = app.emit("proxy-error", diag.clone());
+        return Err(diag);
+    }
+
+    let proxy_state = state.inner().clone();
+    spawn_bridge(app, proxy_state, cfg);
+
+    Ok("Started".into())
+}
+
+#[tauri::command]
+async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut tx_guard = state.shutdown_tx.lock().await;
+    if let Some(tx) = tx_guard.take() {
+        let _ = tx.send(());
+    }
+    state.running.store(false, Ordering::SeqCst);
+    state.stats.connections_active.store(0, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_recent_logs(app: AppHandle) -> Result<Vec<String>, String> {
+    let path = get_log_file_path(&app);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let lines: Vec<String> = content.lines().rev().take(300).map(|s| s.to_string()).collect();
+            let mut lines = lines;
+            lines.reverse();
+            Ok(lines)
+        }
+        Err(e) => Err(format!("Не удалось прочитать файл логов: {:?}", e)),
+    }
+}
+
+#[tauri::command]
+async fn open_log_file(app: AppHandle) -> Result<(), String> {
+    let path = get_log_file_path(&app);
+    if !path.exists() {
+        let _ = fs::write(&path, "");
+    }
+    let p_str = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("Start-Process '{}'", p_str.replace("'", "''"))])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&p_str).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&p_str).spawn();
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn clear_logs(app: AppHandle) -> Result<(), String> {
+    let path = get_log_file_path(&app);
+    let _ = fs::write(path, "");
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    open_url_native(&url);
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    {
+        let mut tx_guard = state.shutdown_tx.lock().await;
+        if let Some(tx) = tx_guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    state.running.store(false, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let cfg = {
+        let guard = state.config.lock().await;
+        guard.clone()
+    };
+    let addr = format!("{}:{}", cfg.host, cfg.port);
+    if let Err(e) = std::net::TcpListener::bind(&addr) {
+        let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &cfg.host, cfg.port);
+        log::error!("Restart failed: {}", diag);
+        let _ = app.emit("proxy-error", diag.clone());
+        return Err(diag);
+    }
+
+    let proxy_state = state.inner().clone();
+    spawn_bridge(app, proxy_state, cfg);
+    Ok("Restarted".into())
+}
+
+#[tauri::command]
+async fn get_tg_link(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(current_tg_link(state.inner()).await)
+}
+
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
@@ -378,6 +531,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Second launch: focus the already running window instead of
+            // conflicting over the proxy port (Single-Instance Guard).
+            show_main_window(app);
+        }))
         .manage(state.clone())
         .setup(move |app| {
             if cfg!(debug_assertions) {
@@ -388,7 +547,8 @@ pub fn run() {
                 )?;
             }
 
-            // Load persisted config
+            // Load persisted config first so logging knows rotation limits
+            // and which domains must be censored.
             let saved_cfg = load_saved_config(app.handle());
             let app_state_clone = app.state::<Arc<AppState>>().inner().clone();
             let initial_cfg = saved_cfg.clone();
@@ -397,9 +557,46 @@ pub fn run() {
                 *cfg = saved_cfg;
             });
 
-            // Automatically launch proxy bridge on startup
+            // File logging with rotation + domain censor (always on,
+            // not only in debug builds).
+            {
+                let handle = app.handle().clone();
+                let log_path = get_log_file_path(&handle);
+                core_logging::init_logging(
+                    log_path,
+                    initial_cfg.log_max_mb,
+                    initial_cfg.verbose,
+                    sensitive_domains_of(&initial_cfg),
+                );
+            }
+            log::info!(
+                "TG WS Proxy v{} starting on {}:{}",
+                env!("CARGO_PKG_VERSION"),
+                initial_cfg.host,
+                initial_cfg.port
+            );
+
+            // Automatically launch proxy bridge on startup.
+            // Failures (e.g. busy port) are emitted to the UI instead of
+            // failing silently.
             let auto_state = app.state::<Arc<AppState>>().inner().clone();
+            let auto_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let cfg_snapshot = {
+                    let guard = auto_state.config.lock().await;
+                    guard.clone()
+                };
+                let addr = format!("{}:{}", cfg_snapshot.host, cfg_snapshot.port);
+                if let Err(e) = std::net::TcpListener::bind(&addr) {
+                    let diag = tg_ws_proxy_core::diagnose_bind_error(
+                        &e,
+                        &cfg_snapshot.host,
+                        cfg_snapshot.port,
+                    );
+                    log::error!("Auto-start failed: {}", diag);
+                    let _ = auto_handle.emit("proxy-error", diag);
+                    return;
+                }
                 auto_state.running.store(true, Ordering::SeqCst);
                 let stats = auto_state.stats.clone();
                 let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
@@ -407,8 +604,15 @@ pub fn run() {
                     let mut tx_guard = auto_state.shutdown_tx.lock().await;
                     *tx_guard = Some(shutdown_tx);
                 }
-                if let Err(e) = tg_ws_proxy_core::run_server_with_stats(initial_cfg, stats, shutdown_rx).await {
+                if let Err(e) = tg_ws_proxy_core::run_server_with_stats(
+                    cfg_snapshot,
+                    stats,
+                    shutdown_rx,
+                )
+                .await
+                {
                     log::error!("Auto-start server error: {:?}", e);
+                    let _ = auto_handle.emit("proxy-error", e.to_string());
                 }
                 auto_state.running.store(false, Ordering::SeqCst);
             });
@@ -444,12 +648,36 @@ pub fn run() {
                 }
             });
 
-            // Create Tray Menu
-            let quit_i = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            // Create Tray Menu (full quick actions, no need to open the window)
+            let open_tg_i = MenuItem::with_id(app, "open_tg", "Открыть в Telegram", true, None::<&str>)?;
+            let copy_link_i =
+                MenuItem::with_id(app, "copy_link", "Скопировать ссылку", true, None::<&str>)?;
+            let restart_i =
+                MenuItem::with_id(app, "restart", "Перезапустить прокси", true, None::<&str>)?;
+            let open_logs_i =
+                MenuItem::with_id(app, "open_logs", "Открыть логи", true, None::<&str>)?;
+            let settings_i = MenuItem::with_id(app, "settings", "Настройки", true, None::<&str>)?;
             let show_i = MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            let quit_i = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &open_tg_i,
+                    &copy_link_i,
+                    &restart_i,
+                    &sep1,
+                    &open_logs_i,
+                    &settings_i,
+                    &show_i,
+                    &sep2,
+                    &quit_i,
+                ],
+            )?;
 
-            let _tray = TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                .tooltip("TG WS Proxy")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -457,10 +685,61 @@ pub fn run() {
                         app.exit(0);
                     }
                     "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                        show_main_window(app);
+                    }
+                    "settings" => {
+                        show_main_window(app);
+                        let _ = app.emit("open-settings", ());
+                    }
+                    "open_tg" => {
+                        let link = tauri::async_runtime::block_on(async {
+                            let st = app.state::<Arc<AppState>>();
+                            current_tg_link(st.inner()).await
+                        });
+                        open_url_native(&link);
+                    }
+                    "copy_link" => {
+                        let link = tauri::async_runtime::block_on(async {
+                            let st = app.state::<Arc<AppState>>();
+                            current_tg_link(st.inner()).await
+                        });
+                        if let Err(e) = app.clipboard().write_text(link) {
+                            log::warn!("Tray copy link failed: {:?}", e);
                         }
+                    }
+                    "restart" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let st = handle.state::<Arc<AppState>>().inner().clone();
+                            {
+                                let mut tx_guard = st.shutdown_tx.lock().await;
+                                if let Some(tx) = tx_guard.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                            st.running.store(false, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            let cfg = { st.config.lock().await.clone() };
+                            let addr = format!("{}:{}", cfg.host, cfg.port);
+                            if let Err(e) = std::net::TcpListener::bind(&addr) {
+                                let diag = tg_ws_proxy_core::diagnose_bind_error(
+                                    &e,
+                                    &cfg.host,
+                                    cfg.port,
+                                );
+                                log::error!("Tray restart failed: {}", diag);
+                                let _ = handle.emit("proxy-error", diag);
+                                return;
+                            }
+                            spawn_bridge(handle, st, cfg);
+                        });
+                    }
+                    "open_logs" => {
+                        let path = get_log_file_path(app);
+                        if !path.exists() {
+                            let _ = fs::write(&path, "");
+                        }
+                        open_url_native(&path.to_string_lossy());
                     }
                     _ => {}
                 })
@@ -471,14 +750,15 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(tray.app_handle());
                     }
-                })
-                .build(app)?;
+                });
+            // Use the bundled app icon for the tray so the logo is visible
+            // instead of a blank/default glyph.
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            let _tray = tray_builder.build(app)?;
 
             Ok(())
         })
@@ -488,8 +768,14 @@ pub fn run() {
             is_running,
             start_proxy,
             stop_proxy,
+            restart_proxy,
+            get_tg_link,
+            get_app_version,
             get_telemetry,
             get_link_host,
+            get_recent_logs,
+            open_log_file,
+            clear_logs,
             open_url,
             minimize_window,
             toggle_maximize_window,
