@@ -303,13 +303,16 @@ async fn handle_connection(
         }
 
         info!("[{}] Connecting to upstream WS {}", label, domain);
-        let conn_res = match RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await {
-            Ok(s) => Ok(s),
-            Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
-        };
+        let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
+        let conn_res = tokio::time::timeout(ct, async {
+            match RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await {
+                Ok(s) => Ok(s),
+                Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
+            }
+        }).await;
 
         match conn_res {
-            Ok(mut socket) => {
+            Ok(Ok(mut socket)) => {
                 if let Err(e) = socket.send(&relay_init).await {
                     warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
                     continue;
@@ -318,8 +321,11 @@ async fn handle_connection(
                 ws = Some(socket);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("[{}] Connection to {} failed: {:?}", label, domain, e);
+            }
+            Err(_) => {
+                warn!("[{}] Connection to {} timed out", label, domain);
             }
         }
     }
@@ -392,7 +398,7 @@ async fn handle_connection(
     {
         info!("[{}] All WebSockets failed, engaging Direct TCP Fallback to {}:443", label, target_ip);
         let tcp_conn = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120)),
             crate::net::tcp_connect(target_ip, 443, io_buf)
         ).await;
 
@@ -415,7 +421,11 @@ async fn handle_connection(
         }
     };
 
-    let splitter = Some(MsgSplitter::new(&relay_init, hs.proto_int));
+    let splitter = if cfg.splitter_enabled {
+        Some(MsgSplitter::new(&relay_init, hs.proto_int))
+    } else {
+        None
+    };
     bridge_ws_reencrypt(
         client_reader,
         client_writer,

@@ -22,7 +22,10 @@ import {
   Wifi,
   Download,
   AlertCircle,
-  FileText
+  FileText,
+  Zap,
+  Scale,
+  EyeOff
 } from 'lucide-vue-next'
 
 interface DcTestResult {
@@ -60,6 +63,8 @@ interface ProxyConfig {
   verbose: boolean
   log_max_mb: number
   pool_max_age_secs: number
+  splitter_enabled: boolean
+  connect_timeout_secs: number
 }
 
 interface TelemetrySnapshot {
@@ -112,6 +117,36 @@ const showTestModal = ref(false)
 
 const updateInfo = ref<UpdateCheckResult | null>(null)
 const isCheckingUpdate = ref(false)
+const showAdvanced = ref(false)
+
+type PresetId = 'speed' | 'balanced' | 'stealth'
+
+const presets: Record<PresetId, { name: string; desc: string; icon: unknown; apply: Partial<ProxyConfig> }> = {
+  speed: {
+    name: 'Макс. скорость',
+    desc: 'Большой пул и буфер 1 МБ, короткий таймаут, без фрагментации',
+    icon: Zap,
+    apply: { pool_size: 8, buffer_size: 1048576, fallback_cfproxy: true, cfproxy_h2_media: true, splitter_enabled: false, connect_timeout_secs: 5 },
+  },
+  balanced: {
+    name: 'Баланс',
+    desc: 'Заводские настройки: пул 4, буфер 256 КБ, фрагментация вкл',
+    icon: Scale,
+    apply: { pool_size: 4, buffer_size: 262144, fallback_cfproxy: true, cfproxy_h2_media: true, splitter_enabled: true, connect_timeout_secs: 10 },
+  },
+  stealth: {
+    name: 'Макс. скрытность',
+    desc: 'Малый пул и буфер 64 КБ, фрагментация вкл, долгий таймаут',
+    icon: EyeOff,
+    apply: { pool_size: 2, buffer_size: 65536, fallback_cfproxy: true, cfproxy_h2_media: false, splitter_enabled: true, connect_timeout_secs: 15 },
+  },
+}
+
+async function applyPreset(id: PresetId) {
+  Object.assign(config.value, presets[id].apply)
+  await updateTgLink(config.value)
+  showToast(`Пресет «${presets[id].name}» применён! Не забудьте сохранить.`)
+}
 
 async function checkForUpdates(manual = false) {
   isCheckingUpdate.value = true
@@ -196,6 +231,8 @@ const config = ref<ProxyConfig>({
   verbose: false,
   log_max_mb: 20,
   pool_max_age_secs: 120,
+  splitter_enabled: true,
+  connect_timeout_secs: 10,
 })
 
 async function generateSecret() {
@@ -581,6 +618,24 @@ onMounted(() => {
 
         <!-- VIEW 2: ПОЛНЫЕ НАСТРОЙКИ (С красивыми кастомными чекбоксами) -->
         <div v-else-if="activeTab === 'settings'" class="space-y-4 max-w-2xl mx-auto pb-4">
+          <!-- 0. Presets -->
+          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
+            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Пресеты (в один клик)</div>
+            <div class="grid grid-cols-3 gap-2.5">
+              <button
+                v-for="(p, id) in presets"
+                :key="id"
+                @click="applyPreset(id as PresetId)"
+                class="p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-blue-500/40 hover:bg-[#1a2030] transition text-left cursor-pointer active:scale-95 group"
+              >
+                <component :is="p.icon" class="w-4 h-4 text-blue-400 mb-1.5 group-hover:scale-110 transition" />
+                <div class="text-xs font-semibold text-white/90">{{ p.name }}</div>
+                <div class="text-[10px] text-white/40 mt-0.5 leading-snug">{{ p.desc }}</div>
+              </button>
+            </div>
+            <div class="text-[10px] text-white/30">Пресет подставляет значения в поля ниже — нажмите «Сохранить настройки», чтобы применить.</div>
+          </div>
+
           <!-- 1. MTProto Connection Settings -->
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Подключение (MTProto)</div>
@@ -1022,6 +1077,99 @@ onMounted(() => {
                 >
                   <RefreshCw class="w-3.5 h-3.5 text-blue-400" :class="isCheckingUpdate ? 'animate-spin' : ''" />
                   <span>{{ isCheckingUpdate ? 'Проверка...' : 'Проверить' }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 5. Advanced (hidden knobs) -->
+          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
+            <button
+              @click="showAdvanced = !showAdvanced"
+              class="w-full flex items-center justify-between cursor-pointer"
+            >
+              <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Продвинутые</div>
+              <component :is="showAdvanced ? ChevronUp : ChevronDown" class="w-4 h-4 text-white/40" />
+            </button>
+
+            <div v-if="showAdvanced" class="space-y-3">
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-[11px] text-white/40 mb-1">TTL сокета в пуле (сек)</label>
+                  <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition">
+                    <input
+                      type="number"
+                      step="10"
+                      v-model.number="config.pool_max_age_secs"
+                      class="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div class="flex flex-col -mr-1">
+                      <button
+                        type="button"
+                        @click="config.pool_max_age_secs = (config.pool_max_age_secs || 0) + 10"
+                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
+                      >
+                        <ChevronUp class="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        @click="config.pool_max_age_secs = Math.max(10, (config.pool_max_age_secs || 0) - 10)"
+                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
+                      >
+                        <ChevronDown class="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label class="block text-[11px] text-white/40 mb-1">Таймаут апстрима (сек)</label>
+                  <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition">
+                    <input
+                      type="number"
+                      v-model.number="config.connect_timeout_secs"
+                      class="w-full bg-transparent text-xs font-mono text-white outline-none"
+                    />
+                    <div class="flex flex-col -mr-1">
+                      <button
+                        type="button"
+                        @click="config.connect_timeout_secs = Math.min(120, (config.connect_timeout_secs || 0) + 1)"
+                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
+                      >
+                        <ChevronUp class="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        @click="config.connect_timeout_secs = Math.max(2, (config.connect_timeout_secs || 0) - 1)"
+                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
+                      >
+                        <ChevronDown class="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Splitter toggle -->
+              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
+                <div class="pr-3">
+                  <div class="text-xs font-semibold text-white/90">Фрагментация пакетов (Splitter)</div>
+                  <div class="text-[10px] text-white/40 mt-0.5">Разбивка первых пакетов для обхода DPI; выключение ускоряет, но упрощает детект</div>
+                </div>
+                <button
+                  type="button"
+                  @click="config.splitter_enabled = !config.splitter_enabled"
+                  :class="[
+                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
+                    config.splitter_enabled ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
+                  ]"
+                >
+                  <div
+                    :class="[
+                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
+                      config.splitter_enabled ? 'translate-x-4' : 'translate-x-0'
+                    ]"
+                  />
                 </button>
               </div>
             </div>

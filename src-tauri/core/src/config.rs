@@ -31,10 +31,22 @@ pub struct ProxyConfig {
     pub log_max_mb: u32,
     #[serde(default = "default_pool_max_age_secs")]
     pub pool_max_age_secs: u64,
+    #[serde(default = "default_true")]
+    pub splitter_enabled: bool,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
 }
 
 fn default_pool_max_age_secs() -> u64 {
     120
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
 }
 
 impl Default for ProxyConfig {
@@ -67,6 +79,8 @@ impl Default for ProxyConfig {
             verbose: false,
             log_max_mb: 20,
             pool_max_age_secs: default_pool_max_age_secs(),
+            splitter_enabled: default_true(),
+            connect_timeout_secs: default_connect_timeout_secs(),
         }
     }
 }
@@ -149,6 +163,8 @@ mod tests {
         }"#;
         let cfg: ProxyConfig = serde_json::from_str(legacy).expect("legacy config must parse");
         assert_eq!(cfg.pool_max_age_secs, default_pool_max_age_secs());
+        assert!(cfg.splitter_enabled);
+        assert_eq!(cfg.connect_timeout_secs, default_connect_timeout_secs());
         assert_eq!(cfg.port, 1443);
     }
 }
