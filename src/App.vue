@@ -7,6 +7,8 @@ import LogsView from './components/LogsView.vue'
 import TelemetryGrid from './components/TelemetryGrid.vue'
 import TgLinkCard from './components/TgLinkCard.vue'
 import DcTestModal from './components/DcTestModal.vue'
+import OnboardingWizard from './components/OnboardingWizard.vue'
+import GuidesView from './components/GuidesView.vue'
 import {
   Play,
   Square,
@@ -23,6 +25,7 @@ import {
   Download,
   AlertCircle,
   FileText,
+  CircleHelp,
   Zap,
   Scale,
   EyeOff
@@ -83,7 +86,8 @@ const isRunning = ref(false)
 const tgLink = ref('')
 const toast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
 const errorToast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
-const activeTab = ref<'main' | 'settings' | 'logs'>('main')
+const activeTab = ref<'main' | 'settings' | 'logs' | 'help'>('main')
+const showWizard = ref(false)
 const autostartActive = ref(false)
 const appVersion = ref('0.2.0')
 
@@ -375,6 +379,12 @@ async function minimizeApp() {
   await invoke('minimize_window')
 }
 
+async function applyOnboarding(data: { port: number; secret: string }) {
+  config.value.port = data.port
+  config.value.secret = data.secret
+  await saveSettings()
+}
+
 async function toggleMaximizeApp() {
   await invoke('toggle_maximize_window')
 }
@@ -383,9 +393,16 @@ async function closeApp() {
   await invoke('close_window')
 }
 
-onMounted(() => {
-  fetchStatus()
+onMounted(async () => {
+  await fetchStatus()
   checkForUpdates(false)
+  try {
+    if (await invoke<boolean>('is_first_run')) {
+      showWizard.value = true
+    }
+  } catch (e) {
+    console.error('First-run check failed:', e)
+  }
   listen<string>('proxy-error', (event) => {
     console.error('Proxy error:', event.payload)
     isRunning.value = false
@@ -491,6 +508,19 @@ onMounted(() => {
             >
               <FileText class="w-4 h-4" />
               <span>Логи</span>
+            </button>
+
+            <button
+              @click="activeTab = 'help'"
+              :class="[
+                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
+                activeTab === 'help'
+                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10'
+                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
+              ]"
+            >
+              <CircleHelp class="w-4 h-4" />
+              <span>Помощь</span>
             </button>
 
             <button 
@@ -1192,6 +1222,13 @@ onMounted(() => {
           @notify="showToast"
           @notify-error="showError"
         />
+
+        <!-- VIEW 4: ПОМОЩЬ -->
+        <GuidesView
+          v-else-if="activeTab === 'help'"
+          @go-main="activeTab = 'main'"
+          @rerun-onboarding="showWizard = true"
+        />
       </main>
     </div>
 
@@ -1249,5 +1286,15 @@ onMounted(() => {
         </button>
       </div>
     </transition>
+
+    <!-- Onboarding Wizard (first run) -->
+    <OnboardingWizard
+      v-if="showWizard"
+      :link="tgLink"
+      :initial-port="config.port"
+      :initial-secret="config.secret"
+      @apply="applyOnboarding"
+      @close="showWizard = false"
+    />
   </div>
 </template>

@@ -363,6 +363,13 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// First-run detection: no persisted config file yet. After the onboarding
+/// wizard saves settings once, this returns false forever.
+#[tauri::command]
+fn is_first_run(app: AppHandle) -> bool {
+    !get_config_path(&app).exists()
+}
+
 #[tauri::command]
 async fn minimize_window(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
@@ -760,6 +767,7 @@ pub fn run() {
             stop_proxy,
             restart_proxy,
             get_app_version,
+            is_first_run,
             get_link_host,
             get_recent_logs,
             open_log_file,
