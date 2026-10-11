@@ -68,12 +68,15 @@ interface ProxyConfig {
   pool_max_age_secs: number
   splitter_enabled: boolean
   connect_timeout_secs: number
+  transport: string
+  quic_relays: string[]
 }
 
 interface TelemetrySnapshot {
   connections_total: number
   connections_active: number
   connections_ws: number
+  connections_quic: number
   connections_cfproxy: number
   connections_tcp: number
   bytes_up: number
@@ -113,6 +116,7 @@ function formatInvokeError(err: unknown): string {
 
 const userDomainsInput = ref('')
 const workerDomainsInput = ref('')
+const quicRelaysInput = ref('')
 const dcRedirectsInput = ref('2: 149.154.167.220, 4: 149.154.167.220')
 
 const isTestingConnectivity = ref(false)
@@ -207,6 +211,7 @@ const telemetry = ref<TelemetrySnapshot>({
   connections_total: 0,
   connections_active: 0,
   connections_ws: 0,
+  connections_quic: 0,
   connections_cfproxy: 0,
   connections_tcp: 0,
   bytes_up: 0,
@@ -237,6 +242,8 @@ const config = ref<ProxyConfig>({
   pool_max_age_secs: 120,
   splitter_enabled: true,
   connect_timeout_secs: 10,
+  transport: 'auto',
+  quic_relays: [],
 })
 
 async function generateSecret() {
@@ -281,6 +288,7 @@ async function fetchStatus() {
     config.value = cfg
     userDomainsInput.value = (cfg.cfproxy_user_domains || []).join(', ')
     workerDomainsInput.value = (cfg.cfproxy_worker_domains || []).join(', ')
+    quicRelaysInput.value = (cfg.quic_relays || []).join(', ')
     dcRedirectsInput.value = Object.entries(cfg.dc_redirects || {})
       .map(([dc, ip]) => `${dc}: ${ip}`)
       .join(', ')
@@ -356,6 +364,11 @@ async function saveSettings() {
       .filter(Boolean)
 
     config.value.cfproxy_worker_domains = workerDomainsInput.value
+      .split(/[\s,;]+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+
+    config.value.quic_relays = quicRelaysInput.value
       .split(/[\s,;]+/)
       .map(s => s.trim())
       .filter(Boolean)
@@ -852,7 +865,34 @@ onMounted(async () => {
             </div>
           </div>
 
-          <!-- 3. Masking & Fake TLS -->
+          <!-- 3. Transport (QUIC experimental) -->
+          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
+            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Транспорт <span class="text-amber-400/80 normal-case font-medium">· QUIC экспериментально</span></div>
+
+            <div>
+              <label class="block text-[11px] text-white/40 mb-1">Режим апстрима</label>
+              <select
+                v-model="config.transport"
+                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs text-white outline-none focus:border-blue-500/50 cursor-pointer"
+              >
+                <option value="auto">Авто (WS → QUIC → CF → TCP)</option>
+                <option value="ws">Только WebSocket</option>
+                <option value="quic">QUIC в первую очередь</option>
+              </select>
+            </div>
+
+            <div v-if="config.transport !== 'ws'">
+              <label class="block text-[11px] text-white/40 mb-1">QUIC-релеи (host:port, через запятую)</label>
+              <input
+                v-model="quicRelaysInput"
+                placeholder="relay.example.com:443"
+                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
+              />
+              <div class="text-[10px] text-white/30 mt-1">Свои UDP-релеи с ALPN tg-ws-proxy-quic-v1. Без релеев поведение как раньше. Ошибка — тихий фолбэк дальше по цепочке.</div>
+            </div>
+          </div>
+
+          <!-- 4. Masking & Fake TLS -->
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Маскировка (Fake TLS)</div>
 

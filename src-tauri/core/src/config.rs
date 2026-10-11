@@ -35,6 +35,13 @@ pub struct ProxyConfig {
     pub splitter_enabled: bool,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Upstream transport: "auto" (WS, then QUIC relays if set, then
+    /// fallbacks), "ws" (WebSocket only), "quic" (QUIC relays first).
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// User-run QUIC relays as `host:port` (experimental, v1.0 phase 3).
+    #[serde(default)]
+    pub quic_relays: Vec<String>,
 }
 
 fn default_pool_max_age_secs() -> u64 {
@@ -47,6 +54,10 @@ fn default_true() -> bool {
 
 fn default_connect_timeout_secs() -> u64 {
     10
+}
+
+fn default_transport() -> String {
+    "auto".to_string()
 }
 
 impl Default for ProxyConfig {
@@ -81,6 +92,8 @@ impl Default for ProxyConfig {
             pool_max_age_secs: default_pool_max_age_secs(),
             splitter_enabled: default_true(),
             connect_timeout_secs: default_connect_timeout_secs(),
+            transport: default_transport(),
+            quic_relays: Vec::new(),
         }
     }
 }
@@ -165,6 +178,8 @@ mod tests {
         assert_eq!(cfg.pool_max_age_secs, default_pool_max_age_secs());
         assert!(cfg.splitter_enabled);
         assert_eq!(cfg.connect_timeout_secs, default_connect_timeout_secs());
+        assert_eq!(cfg.transport, default_transport());
+        assert!(cfg.quic_relays.is_empty());
         assert_eq!(cfg.port, 1443);
     }
 }

@@ -11,6 +11,7 @@ rust-version = "1.95.0"
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
 tokio-rustls = "0.26"
+rustls = "0.23"
 rustls-pki-types = "1.10"
 webpki-roots = "1.0"
 aes = "0.9"
@@ -29,11 +30,13 @@ http = "1.2"
 httparse = "1.9"
 h2 = "0.4"
 socket2 = "0.5"
+quinn = "0.11"
 hex = "0.4"
 base64 = "0.23"
 
 [dev-dependencies]
 criterion = "0.5"
+rcgen = "0.13"
 
 [[bench]]
 name = "throughput"

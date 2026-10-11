@@ -23,6 +23,11 @@ fn apply_buf(sock: &socket2::Socket, io_buf: usize) {
 }
 
 async fn resolve(host: &str, port: u16) -> io::Result<std::net::SocketAddr> {
+    resolve_host(host, port).await
+}
+
+/// Resolve `host:port` to a socket address (first result).
+pub async fn resolve_host(host: &str, port: u16) -> io::Result<std::net::SocketAddr> {
     tokio::net::lookup_host((host, port))
         .await?
         .next()

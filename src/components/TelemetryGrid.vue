@@ -6,6 +6,7 @@ export interface TelemetryData {
   connections_total: number
   connections_active: number
   connections_ws: number
+  connections_quic: number
   connections_cfproxy: number
   connections_tcp: number
   bytes_up: number
@@ -81,7 +82,7 @@ defineProps<{
         WS + H2
       </div>
       <div class="text-[10px] text-white/40 truncate">
-        Cloudflare CDN
+        {{ telemetry.connections_quic > 0 ? `QUIC-сессий: ${telemetry.connections_quic}` : 'Cloudflare CDN' }}
       </div>
     </div>
   </div>

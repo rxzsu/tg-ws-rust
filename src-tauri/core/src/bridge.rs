@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use aes::cipher::StreamCipher;
 use crate::crypto::CryptoCtx;
 use crate::fake_tls::{ClientReader, ClientWriter};
@@ -13,6 +12,13 @@ use tracing::{debug, info};
 pub struct BridgeOptions {
     pub splitter: Option<MsgSplitter>,
     pub io_buf: usize,
+}
+
+/// Upstream halves for the fallback bridge: plain TCP after `into_split`,
+/// or a QUIC bidirectional stream pair. Anything `AsyncRead`/`AsyncWrite`.
+pub struct RemoteIo<R, W> {
+    pub reader: R,
+    pub writer: W,
 }
 
 pub async fn bridge_ws_reencrypt(
@@ -118,17 +124,22 @@ pub async fn bridge_ws_reencrypt(
     Ok(())
 }
 
-pub async fn bridge_tcp_fallback(
+pub async fn bridge_tcp_fallback<R, W>(
     mut client_reader: ClientReader,
     mut client_writer: ClientWriter,
-    remote_stream: TcpStream,
+    remote: RemoteIo<R, W>,
     ctx: CryptoCtx,
     stats: Arc<Stats>,
     label: String,
     io_buf: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut remote_reader, mut remote_writer) = remote_stream.into_split();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
     let buf_size = crate::net::clamp_io_buf(io_buf);
+    let mut remote_reader = remote.reader;
+    let mut remote_writer = remote.writer;
 
     let mut clt_dec = ctx.clt_dec;
     let mut clt_enc = ctx.clt_enc;

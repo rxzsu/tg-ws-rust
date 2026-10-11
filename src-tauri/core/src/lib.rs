@@ -8,6 +8,7 @@ pub mod handshake;
 pub mod logging;
 pub mod net;
 pub mod pool;
+pub mod quic;
 pub mod raw_websocket;
 pub mod splitter;
 pub mod stats;
@@ -18,7 +19,7 @@ use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
 use crate::balancer::Balancer;
-use crate::bridge::{bridge_tcp_fallback, bridge_ws_reencrypt, BridgeOptions};
+use crate::bridge::{bridge_tcp_fallback, bridge_ws_reencrypt, BridgeOptions, RemoteIo};
 use crate::config::{get_default_dc_ip, ProxyConfig};
 use crate::crypto::CryptoCtx;
 use crate::fake_tls::{
@@ -330,6 +331,43 @@ async fn handle_connection(
         }
     }
 
+    // 1b. QUIC relays (experimental): only when enabled AND relays are
+    // configured. Telegram DCs don't speak QUIC, so without user relays
+    // this step is skipped entirely (zero behavior change by default).
+    if ws.is_none() && cfg.transport != "ws" && !cfg.quic_relays.is_empty() {
+        let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
+        for relay in &cfg.quic_relays {
+            info!("[{}] QUIC relay: {}", label, relay);
+            match crate::quic::connect_quic(relay, ct).await {
+                Ok(mut up) => {
+                    if up.send.write_all(&relay_init).await.is_ok() {
+                        stats
+                            .connections_quic
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        info!("[{}] QUIC relay {} connected", label, relay);
+                        return bridge_tcp_fallback(
+                            client_reader,
+                            client_writer,
+                            RemoteIo {
+                                reader: up.recv,
+                                writer: up.send,
+                            },
+                            ctx,
+                            stats,
+                            label,
+                            io_buf,
+                        )
+                        .await;
+                    }
+                    warn!("[{}] QUIC relay {} init failed", label, relay);
+                }
+                Err(e) => {
+                    warn!("[{}] QUIC relay {} failed: {:?}", label, relay, e);
+                }
+            }
+        }
+    }
+
     // 2. Fallback: CF Worker / CF Domains / Dynamic Balancer if direct WS failed
     if ws.is_none() && cfg.fallback_cfproxy {
         let fallback_ip = get_default_dc_ip(dc_id, is_test);
@@ -407,7 +445,8 @@ async fn handle_connection(
             if remote_stream.write_all(&relay_init).await.is_ok() && remote_stream.flush().await.is_ok() {
                 stats.connections_tcp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("[{}] Direct TCP Fallback connected to {}:443", label, target_ip);
-                return bridge_tcp_fallback(client_reader, client_writer, remote_stream, ctx, stats, label, io_buf).await;
+                let (remote_reader, remote_writer) = remote_stream.into_split();
+                return bridge_tcp_fallback(client_reader, client_writer, RemoteIo { reader: remote_reader, writer: remote_writer }, ctx, stats, label, io_buf).await;
             }
         } else {
             warn!("[{}] Direct TCP Fallback connection to {}:443 failed", label, target_ip);
