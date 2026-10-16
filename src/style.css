@@ -30,6 +30,16 @@ body {
   height: 100%;
 }
 
+/* Mobile/touch: disable double-tap zoom and tap highlight */
+@media (pointer: coarse) {
+  html {
+    touch-action: manipulation;
+  }
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
 /* Custom dark scrollbar */
 ::-webkit-scrollbar {
   width: 5px;

@@ -21,7 +21,7 @@ defineProps<{
 </script>
 
 <template>
-  <div class="grid grid-cols-4 gap-3">
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
     <!-- Metric 1: Upload -->
     <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
       <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">

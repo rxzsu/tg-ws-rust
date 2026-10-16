@@ -468,9 +468,9 @@ onMounted(async () => {
     </header>
 
     <!-- Main Layout (Sidebar + Content) -->
-    <div class="flex-1 flex overflow-hidden p-3 gap-3 pt-0">
-      <!-- Left Sidebar -->
-      <aside class="w-60 bg-[#16191f] rounded-2xl p-4 flex flex-col justify-between border border-white/5 shadow-inner shrink-0">
+    <div class="flex-1 flex overflow-hidden p-3 gap-3 pt-0 pb-16 md:pb-3">
+      <!-- Left Sidebar (desktop only; mobile uses bottom tab bar) -->
+      <aside class="hidden md:flex w-60 bg-[#16191f] rounded-2xl p-4 flex-col justify-between border border-white/5 shadow-inner shrink-0">
         <div class="space-y-6">
           <!-- Logo / App Name -->
           <div class="flex items-center gap-3">
@@ -566,7 +566,7 @@ onMounted(async () => {
       </aside>
 
       <!-- Right Main Content Area -->
-      <main class="flex-1 bg-[#16191f] rounded-2xl p-5 border border-white/5 shadow-inner overflow-y-auto">
+      <main class="flex-1 bg-[#16191f] rounded-2xl p-4 md:p-5 border border-white/5 shadow-inner overflow-y-auto">
         <!-- New Version Update Banner -->
         <div 
           v-if="updateInfo && updateInfo.has_update" 
@@ -664,7 +664,7 @@ onMounted(async () => {
           <!-- 0. Presets -->
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Пресеты (в один клик)</div>
-            <div class="grid grid-cols-3 gap-2.5">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
               <button
                 v-for="(p, id) in presets"
                 :key="id"
@@ -683,7 +683,7 @@ onMounted(async () => {
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Подключение (MTProto)</div>
             
-            <div class="grid grid-cols-3 gap-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div class="col-span-2">
                 <label class="block text-[11px] text-white/40 mb-1">Хост</label>
                 <input 
@@ -933,7 +933,7 @@ onMounted(async () => {
           <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
             <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Система и оптимизация</div>
 
-            <div class="grid grid-cols-3 gap-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div>
                 <label class="block text-[11px] text-white/40 mb-1">Буфер сокета (байт)</label>
                 <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition group">
@@ -1271,6 +1271,35 @@ onMounted(async () => {
         />
       </main>
     </div>
+
+    <!-- Mobile Bottom Tab Bar (md:hidden) -->
+    <nav class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#16191f]/95 backdrop-blur-md border-t border-white/5 flex items-center justify-around px-2 py-2">
+      <button
+        v-for="t in [
+          { id: 'main', label: 'Мост', icon: Activity },
+          { id: 'settings', label: 'Настройки', icon: Settings },
+          { id: 'logs', label: 'Логи', icon: FileText },
+          { id: 'help', label: 'Помощь', icon: CircleHelp },
+        ]"
+        :key="t.id"
+        @click="activeTab = t.id as any"
+        :class="[
+          'flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[10px] font-medium transition cursor-pointer',
+          activeTab === t.id ? 'text-blue-400' : 'text-white/40'
+        ]"
+      >
+        <component :is="t.icon" class="w-5 h-5" />
+        <span>{{ t.label }}</span>
+      </button>
+      <button
+        @click="runConnectivityTest"
+        :disabled="isTestingConnectivity"
+        class="flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[10px] font-medium transition cursor-pointer text-white/40 disabled:opacity-50"
+      >
+        <Wifi class="w-5 h-5 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
+        <span>{{ isTestingConnectivity ? 'Тест...' : 'DC' }}</span>
+      </button>
+    </nav>
 
     <!-- Connectivity Test Modal Dialog -->
     <DcTestModal
