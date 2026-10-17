@@ -27,6 +27,9 @@ tauri-plugin-log = "2"
 tauri-plugin-clipboard-manager = "2"
 tg-ws-proxy-core = { path = "./core" }
 tokio = { version = "1.43", features = ["full"] }
+# Explicit crypto provider selection at startup (see src/main.rs).
+# `ring` matches the feature set used by quinn/tokio-rustls in the core crate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"

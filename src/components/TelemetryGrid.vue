@@ -1,88 +1,70 @@
 <script setup lang="ts">
-import { ArrowUp, ArrowDown, Activity } from 'lucide-vue-next'
+import { ArrowUp, ArrowDown, Activity, Waypoints } from 'lucide-vue-next'
 import { formatBytes } from '../utils/format'
-
-export interface TelemetryData {
-  connections_total: number
-  connections_active: number
-  connections_ws: number
-  connections_quic: number
-  connections_cfproxy: number
-  connections_tcp: number
-  bytes_up: number
-  bytes_down: number
-  speed_up_kbps: number
-  speed_down_kbps: number
-}
+import type { TelemetrySnapshot } from '../composables/useProxy'
 
 defineProps<{
-  telemetry: TelemetryData
+  telemetry: TelemetrySnapshot
 }>()
 </script>
 
 <template>
-  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
-    <!-- Metric 1: Upload -->
-    <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-      <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
+  <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+    <!-- Upload -->
+    <div class="glass min-w-0 rounded-xl px-3.5 py-2.5 transition duration-200 hover:border-white/[0.16]">
+      <div class="flex items-center justify-between text-[10px] font-medium text-ink-2">
         <span>Отдача</span>
-        <div class="w-6 h-6 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
-          <ArrowUp class="w-3.5 h-3.5" />
-        </div>
+        <ArrowUp class="h-3 w-3 text-[#5bc5f5]" />
       </div>
-      <div class="text-lg font-bold text-white font-mono tracking-tight">
-        {{ telemetry.speed_up_kbps.toFixed(1) }} <span class="text-xs font-normal text-white/40">Кб/с</span>
+      <div class="mt-1 font-mono text-sm font-bold tracking-tight text-white">
+        {{ telemetry.speed_up_kbps.toFixed(1) }}
+        <span class="text-[10px] font-normal text-ink-3">Кб/с</span>
       </div>
-      <div class="text-[10px] text-white/40 font-mono">
-        Всего: {{ formatBytes(telemetry.bytes_up) }}
+      <div class="font-mono text-[9.5px] text-ink-3">
+        {{ formatBytes(telemetry.bytes_up) }}
       </div>
     </div>
 
-    <!-- Metric 2: Download -->
-    <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-      <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
+    <!-- Download -->
+    <div class="glass min-w-0 rounded-xl px-3.5 py-2.5 transition duration-200 hover:border-white/[0.16]">
+      <div class="flex items-center justify-between text-[10px] font-medium text-ink-2">
         <span>Загрузка</span>
-        <div class="w-6 h-6 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
-          <ArrowDown class="w-3.5 h-3.5" />
-        </div>
+        <ArrowDown class="h-3 w-3 text-emerald-400" />
       </div>
-      <div class="text-lg font-bold text-emerald-400 font-mono tracking-tight">
-        {{ telemetry.speed_down_kbps.toFixed(1) }} <span class="text-xs font-normal text-white/40">Кб/с</span>
+      <div class="mt-1 font-mono text-sm font-bold tracking-tight text-emerald-300">
+        {{ telemetry.speed_down_kbps.toFixed(1) }}
+        <span class="text-[10px] font-normal text-ink-3">Кб/с</span>
       </div>
-      <div class="text-[10px] text-white/40 font-mono">
-        Всего: {{ formatBytes(telemetry.bytes_down) }}
+      <div class="font-mono text-[9.5px] text-ink-3">
+        {{ formatBytes(telemetry.bytes_down) }}
       </div>
     </div>
 
-    <!-- Metric 3: Active Sockets -->
-    <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-      <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-        <span>Активные сокеты</span>
-        <div class="w-6 h-6 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
-          <Activity class="w-3.5 h-3.5" />
-        </div>
+    <!-- Active sockets -->
+    <div class="glass min-w-0 rounded-xl px-3.5 py-2.5 transition duration-200 hover:border-white/[0.16]">
+      <div class="flex items-center justify-between text-[10px] font-medium text-ink-2">
+        <span>Сокеты</span>
+        <Activity class="h-3 w-3 text-amber-400" />
       </div>
-      <div class="text-lg font-bold text-white font-mono tracking-tight">
+      <div class="mt-1 font-mono text-sm font-bold tracking-tight text-white">
         {{ telemetry.connections_active }}
       </div>
-      <div class="text-[10px] text-white/40">
-        Всего сессий: {{ telemetry.connections_total }}
+      <div class="text-[9.5px] text-ink-3">
+        Всего: {{ telemetry.connections_total }}
       </div>
     </div>
 
-    <!-- Metric 4: Transport -->
-    <div class="bg-gradient-to-b from-[#1c212b] to-[#161922] border border-white/[0.06] hover:border-white/10 transition duration-200 rounded-2xl p-4 space-y-2 shadow-lg shadow-black/20">
-      <div class="flex items-center justify-between text-[11px] text-white/50 font-medium">
-        <span>Транспорт</span>
-        <div class="w-6 h-6 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 font-bold text-[10px] font-mono">
-          CF
-        </div>
+    <!-- Transport -->
+    <div class="glass min-w-0 rounded-xl px-3.5 py-2.5 transition duration-200 hover:border-white/[0.16]">
+      <div class="flex items-center justify-between gap-1 text-[10px] font-medium text-ink-2">
+        <span class="truncate">Транспорт</span>
+        <Waypoints class="h-3 w-3 shrink-0 text-violet-300" />
       </div>
-      <div class="text-base font-bold text-purple-300 font-mono tracking-tight">
+      <div class="mt-1 truncate font-mono text-sm font-bold tracking-tight text-violet-300">
         WS + H2
       </div>
-      <div class="text-[10px] text-white/40 truncate">
-        {{ telemetry.connections_quic > 0 ? `QUIC-сессий: ${telemetry.connections_quic}` : 'Cloudflare CDN' }}
+      <div class="truncate text-[9.5px] text-ink-3">
+        {{ telemetry.connections_quic > 0 ? `QUIC: ${telemetry.connections_quic}` : 'Cloudflare CDN' }}
       </div>
     </div>
   </div>

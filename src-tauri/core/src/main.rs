@@ -4,6 +4,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // rustls >= 0.23.46 requires an explicit process-wide crypto provider
+    // when both `ring` and `aws-lc-rs` are present in the tree.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

@@ -1,1307 +1,131 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, type Component } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { enable, isEnabled, disable } from '@tauri-apps/plugin-autostart'
-import LogsView from './components/LogsView.vue'
-import TelemetryGrid from './components/TelemetryGrid.vue'
-import TgLinkCard from './components/TgLinkCard.vue'
+import { Download, LayoutDashboard, Settings2, ScrollText, LifeBuoy, Wifi } from 'lucide-vue-next'
+import TitleBar from './components/layout/TitleBar.vue'
+import SideNav from './components/layout/SideNav.vue'
+import ToastHost from './components/ToastHost.vue'
 import DcTestModal from './components/DcTestModal.vue'
 import OnboardingWizard from './components/OnboardingWizard.vue'
-import GuidesView from './components/GuidesView.vue'
-import {
-  Play,
-  Square,
-  Check,
-  Settings,
-  Activity,
-  Minus,
-  Maximize2,
-  X,
-  RefreshCw,
-  ChevronUp,
-  ChevronDown,
-  Wifi,
-  Download,
-  AlertCircle,
-  FileText,
-  CircleHelp,
-  Zap,
-  Scale,
-  EyeOff
-} from 'lucide-vue-next'
+import DashboardView from './views/DashboardView.vue'
+import SettingsView from './views/SettingsView.vue'
+import LogsView from './views/LogsView.vue'
+import GuidesView from './views/GuidesView.vue'
+import { useProxy, initProxy, runConnectivityTest, type TabId } from './composables/useProxy'
+import { pushToast } from './composables/useToast'
 
-interface DcTestResult {
-  dc: string
-  host: string
-  ok: boolean
-  latency_ms: number
-  message: string
-}
-
-interface UpdateCheckResult {
-  has_update: boolean
-  current_version: string
-  latest_version: string
-  release_url: string
-}
-
-interface ProxyConfig {
-  host: string
-  port: number
-  secret: string
-  dc_redirects: Record<number, string>
-  buffer_size: number
-  pool_size: number
-  fallback_cfproxy: boolean
-  cfproxy_user_domain_enabled: boolean
-  cfproxy_user_domains: string[]
-  cfproxy_worker_enabled: boolean
-  cfproxy_worker_domains: string[]
-  cfproxy_h2_media: boolean
-  disable_secure: boolean
-  fake_tls_domain: string
-  proxy_protocol: boolean
-  force_test_dc: boolean
-  verbose: boolean
-  log_max_mb: number
-  pool_max_age_secs: number
-  splitter_enabled: boolean
-  connect_timeout_secs: number
-  transport: string
-  quic_relays: string[]
-}
-
-interface TelemetrySnapshot {
-  connections_total: number
-  connections_active: number
-  connections_ws: number
-  connections_quic: number
-  connections_cfproxy: number
-  connections_tcp: number
-  bytes_up: number
-  bytes_down: number
-  speed_up_kbps: number
-  speed_down_kbps: number
-}
-
-const isRunning = ref(false)
-const tgLink = ref('')
-const toast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
-const errorToast = ref<{ show: boolean; message: string }>({ show: false, message: '' })
-const activeTab = ref<'main' | 'settings' | 'logs' | 'help'>('main')
+const activeTab = ref<TabId>('main')
 const showWizard = ref(false)
-const autostartActive = ref(false)
-const appVersion = ref('0.2.0')
+const sidebarCollapsed = ref(false)
 
-function showToast(message: string) {
-  toast.value = { show: true, message }
-  setTimeout(() => {
-    toast.value.show = false
-  }, 2600)
-}
-
-function showError(message: string) {
-  errorToast.value = { show: true, message }
-  setTimeout(() => {
-    errorToast.value.show = false
-  }, 6000)
-}
-
-function formatInvokeError(err: unknown): string {
-  if (typeof err === 'string') return err
-  if (err && typeof err === 'object' && 'message' in err) return String((err as { message: unknown }).message)
-  return String(err)
-}
-
-const userDomainsInput = ref('')
-const workerDomainsInput = ref('')
-const quicRelaysInput = ref('')
-const dcRedirectsInput = ref('2: 149.154.167.220, 4: 149.154.167.220')
-
-const isTestingConnectivity = ref(false)
-const testResults = ref<DcTestResult[]>([])
-const showTestModal = ref(false)
-
-const updateInfo = ref<UpdateCheckResult | null>(null)
-const isCheckingUpdate = ref(false)
-const showAdvanced = ref(false)
-
-type PresetId = 'speed' | 'balanced' | 'stealth'
-
-const presets: Record<PresetId, { name: string; desc: string; icon: unknown; apply: Partial<ProxyConfig> }> = {
-  speed: {
-    name: 'Макс. скорость',
-    desc: 'Большой пул и буфер 1 МБ, короткий таймаут, без фрагментации',
-    icon: Zap,
-    apply: { pool_size: 8, buffer_size: 1048576, fallback_cfproxy: true, cfproxy_h2_media: true, splitter_enabled: false, connect_timeout_secs: 5 },
-  },
-  balanced: {
-    name: 'Баланс',
-    desc: 'Заводские настройки: пул 4, буфер 256 КБ, фрагментация вкл',
-    icon: Scale,
-    apply: { pool_size: 4, buffer_size: 262144, fallback_cfproxy: true, cfproxy_h2_media: true, splitter_enabled: true, connect_timeout_secs: 10 },
-  },
-  stealth: {
-    name: 'Макс. скрытность',
-    desc: 'Малый пул и буфер 64 КБ, фрагментация вкл, долгий таймаут',
-    icon: EyeOff,
-    apply: { pool_size: 2, buffer_size: 65536, fallback_cfproxy: true, cfproxy_h2_media: false, splitter_enabled: true, connect_timeout_secs: 15 },
-  },
-}
-
-async function applyPreset(id: PresetId) {
-  Object.assign(config.value, presets[id].apply)
-  await updateTgLink(config.value)
-  showToast(`Пресет «${presets[id].name}» применён! Не забудьте сохранить.`)
-}
-
-async function checkForUpdates(manual = false) {
-  isCheckingUpdate.value = true
-  try {
-    const res = await invoke<UpdateCheckResult>('check_updates')
-    updateInfo.value = res
-    if (manual) {
-      if (res.has_update) {
-        showToast(`Доступна новая версия: ${res.latest_version}!`)
-      } else {
-        showToast('У вас установлена самая актуальная версия!')
-      }
-    }
-  } catch (e) {
-    console.error('Update check error:', e)
-    if (manual) showToast('Ошибка при проверке обновлений')
-  } finally {
-    isCheckingUpdate.value = false
-  }
-}
-
-async function runConnectivityTest() {
-  isTestingConnectivity.value = true
-  showTestModal.value = true
-  try {
-    const custom = userDomainsInput.value
-      .split(/[\s,;]+/)
-      .map(s => s.trim())
-      .filter(Boolean)
-    testResults.value = await invoke<DcTestResult[]>('test_connectivity', { customDomains: custom })
-  } catch (e) {
-    console.error('Connectivity test error:', e)
-  } finally {
-    isTestingConnectivity.value = false
-  }
-}
-
-function parseDcRedirects(text: string): Record<number, string> {
-  const result: Record<number, string> = {}
-  const pairs = text.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
-  for (const pair of pairs) {
-    const [dcStr, ip] = pair.split(':')
-    if (dcStr && ip) {
-      const dcNum = parseInt(dcStr.trim(), 10)
-      if (!isNaN(dcNum)) {
-        result[dcNum] = ip.trim()
-      }
-    }
-  }
-  return result
-}
-
-const telemetry = ref<TelemetrySnapshot>({
-  connections_total: 0,
-  connections_active: 0,
-  connections_ws: 0,
-  connections_quic: 0,
-  connections_cfproxy: 0,
-  connections_tcp: 0,
-  bytes_up: 0,
-  bytes_down: 0,
-  speed_up_kbps: 0,
-  speed_down_kbps: 0,
-})
-
-const config = ref<ProxyConfig>({
-  host: '127.0.0.1',
-  port: 1443,
-  secret: '',
-  dc_redirects: { 2: '149.154.167.220', 4: '149.154.167.220' },
-  buffer_size: 262144,
-  pool_size: 4,
-  fallback_cfproxy: true,
-  cfproxy_user_domain_enabled: false,
-  cfproxy_user_domains: [],
-  cfproxy_worker_enabled: false,
-  cfproxy_worker_domains: [],
-  cfproxy_h2_media: true,
-  disable_secure: false,
-  fake_tls_domain: '',
-  proxy_protocol: false,
-  force_test_dc: false,
-  verbose: false,
-  log_max_mb: 20,
-  pool_max_age_secs: 120,
-  splitter_enabled: true,
-  connect_timeout_secs: 10,
-  transport: 'auto',
-  quic_relays: [],
-})
-
-async function generateSecret() {
-  const arr = new Uint8Array(16)
-  window.crypto.getRandomValues(arr)
-  config.value.secret = Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
-  await updateTgLink(config.value)
-}
-
-async function updateTgLink(cfg: ProxyConfig) {
-  let host = cfg.host
-  if (host === '0.0.0.0') {
-    try {
-      host = await invoke<string>('get_link_host', { host: cfg.host })
-    } catch {
-      host = '127.0.0.1'
-    }
-  }
-  let cleanSecret = cfg.secret.trim()
-  // Only slice 'dd' or 'ee' prefix if length is greater than 32 (meaning prefix was already prepended)
-  if ((cleanSecret.startsWith('dd') || cleanSecret.startsWith('ee')) && cleanSecret.length > 32) {
-    cleanSecret = cleanSecret.slice(2)
-  }
-
-  let formattedSecret = ''
-  if (cfg.fake_tls_domain && cfg.fake_tls_domain.trim()) {
-    const sniHex = Array.from(new TextEncoder().encode(cfg.fake_tls_domain.trim()))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('')
-    formattedSecret = `ee${cleanSecret}${sniHex}`
-  } else {
-    formattedSecret = `dd${cleanSecret}`
-  }
-
-  tgLink.value = `tg://proxy?server=${host}&port=${cfg.port}&secret=${formattedSecret}`
-}
-
-async function fetchStatus() {
-  try {
-    isRunning.value = await invoke<boolean>('is_running')
-    const cfg = await invoke<ProxyConfig>('get_config')
-    config.value = cfg
-    userDomainsInput.value = (cfg.cfproxy_user_domains || []).join(', ')
-    workerDomainsInput.value = (cfg.cfproxy_worker_domains || []).join(', ')
-    quicRelaysInput.value = (cfg.quic_relays || []).join(', ')
-    dcRedirectsInput.value = Object.entries(cfg.dc_redirects || {})
-      .map(([dc, ip]) => `${dc}: ${ip}`)
-      .join(', ')
-
-    await updateTgLink(cfg)
-    autostartActive.value = await isEnabled()
-    try {
-      appVersion.value = await invoke<string>('get_app_version')
-    } catch {
-      /* keep default */
-    }
-  } catch (err) {
-    console.error('Failed to load status:', err)
-  }
-}
-
-async function toggleAutostart() {
-  try {
-    if (autostartActive.value) {
-      await disable()
-      autostartActive.value = false
-    } else {
-      await enable()
-      autostartActive.value = true
-    }
-  } catch (err) {
-    console.error('Error toggling autostart:', err)
-  }
-}
-
-async function toggleProxy() {
-  if (isRunning.value) {
-    try {
-      await invoke('stop_proxy')
-      isRunning.value = false
-      telemetry.value.connections_active = 0
-      telemetry.value.speed_up_kbps = 0
-      telemetry.value.speed_down_kbps = 0
-    } catch (err) {
-      console.error('Error stopping proxy:', err)
-      showError(formatInvokeError(err))
-    }
-    return
-  }
-
-  try {
-    await invoke<string>('start_proxy')
-    await updateTgLink(config.value)
-    isRunning.value = true
-  } catch (err) {
-    console.error('Error starting proxy:', err)
-    isRunning.value = false
-    showError(formatInvokeError(err))
-  }
-}
-
-async function restartProxy() {
-  try {
-    await invoke<string>('restart_proxy')
-    isRunning.value = true
-    showToast('Прокси перезапущен!')
-  } catch (err) {
-    console.error('Error restarting proxy:', err)
-    showError(formatInvokeError(err))
-  }
-}
-
-async function saveSettings() {
-  try {
-    config.value.cfproxy_user_domains = userDomainsInput.value
-      .split(/[\s,;]+/)
-      .map(s => s.trim())
-      .filter(Boolean)
-
-    config.value.cfproxy_worker_domains = workerDomainsInput.value
-      .split(/[\s,;]+/)
-      .map(s => s.trim())
-      .filter(Boolean)
-
-    config.value.quic_relays = quicRelaysInput.value
-      .split(/[\s,;]+/)
-      .map(s => s.trim())
-      .filter(Boolean)
-
-    config.value.dc_redirects = parseDcRedirects(dcRedirectsInput.value)
-
-    await invoke('save_config', { newConfig: config.value })
-    await updateTgLink(config.value)
-    isRunning.value = await invoke<boolean>('is_running')
-    showToast('Настройки успешно применены и сохранены!')
-  } catch (err) {
-    console.error('Error saving settings:', err)
-    try {
-      isRunning.value = await invoke<boolean>('is_running')
-    } catch { /* ignore */ }
-    showError(formatInvokeError(err))
-  }
-}
-
-async function minimizeApp() {
-  await invoke('minimize_window')
-}
-
-async function applyOnboarding(data: { port: number; secret: string }) {
-  config.value.port = data.port
-  config.value.secret = data.secret
-  await saveSettings()
-}
-
-async function toggleMaximizeApp() {
-  await invoke('toggle_maximize_window')
-}
-
-async function closeApp() {
-  await invoke('close_window')
-}
+const {
+  isRunning,
+  updateInfo,
+  isTestingConnectivity,
+  testResults,
+  showTestModal,
+} = useProxy()
 
 onMounted(async () => {
-  await fetchStatus()
-  checkForUpdates(false)
-  try {
-    if (await invoke<boolean>('is_first_run')) {
-      showWizard.value = true
-    }
-  } catch (e) {
-    console.error('First-run check failed:', e)
-  }
+  const firstRun = await initProxy()
+  showWizard.value = firstRun
+
   listen<string>('proxy-error', (event) => {
     console.error('Proxy error:', event.payload)
     isRunning.value = false
-    showError(event.payload)
+    pushToast(event.payload, 'error', 7000)
   })
+
   listen('open-settings', () => {
     activeTab.value = 'settings'
   })
-  listen<TelemetrySnapshot>('telemetry-update', (event) => {
-    if (!isRunning.value) {
-      event.payload.connections_active = 0
-      event.payload.speed_up_kbps = 0
-      event.payload.speed_down_kbps = 0
-    }
-    telemetry.value = event.payload
-  })
 })
+
+const views: Record<TabId, Component> = {
+  main: DashboardView,
+  settings: SettingsView,
+  logs: LogsView,
+  help: GuidesView,
+}
+
+const mobileItems: Array<{ id: TabId; label: string; icon: Component }> = [
+  { id: 'main', label: 'Мост', icon: LayoutDashboard },
+  { id: 'settings', label: 'Настройки', icon: Settings2 },
+  { id: 'logs', label: 'Логи', icon: ScrollText },
+  { id: 'help', label: 'Помощь', icon: LifeBuoy },
+]
+
+async function openRelease() {
+  if (updateInfo.value) {
+    await invoke('open_url', { url: updateInfo.value.release_url })
+  }
+}
 </script>
 
 <template>
-  <div class="flex flex-col h-screen w-screen bg-[#111317] text-[#e1e4ea] font-sans overflow-hidden select-none border border-white/5 rounded-xl shadow-2xl">
-    <!-- Custom Draggable Header -->
-    <header data-tauri-drag-region class="h-9 bg-[#111317] flex items-center justify-between px-3 shrink-0 cursor-move">
-      <div data-tauri-drag-region class="flex items-center gap-2 pointer-events-none">
-        <span class="text-[11px] font-semibold text-white/40 tracking-wider font-mono">TG-WS-PROXY</span>
-      </div>
-      <div class="flex items-center gap-1">
-        <button 
-          @click="minimizeApp"
-          class="w-7 h-6 flex items-center justify-center rounded hover:bg-white/10 text-white/50 hover:text-white transition"
-          title="Свернуть"
-        >
-          <Minus class="w-3.5 h-3.5" />
-        </button>
-        <button 
-          @click="toggleMaximizeApp"
-          class="w-7 h-6 flex items-center justify-center rounded hover:bg-white/10 text-white/50 hover:text-white transition"
-          title="Развернуть"
-        >
-          <Maximize2 class="w-3 h-3" />
-        </button>
-        <button 
-          @click="closeApp"
-          class="w-7 h-6 flex items-center justify-center rounded hover:bg-rose-500/20 hover:text-rose-300 text-white/50 transition"
-          title="В трей"
-        >
-          <X class="w-3.5 h-3.5" />
-        </button>
-      </div>
-    </header>
+  <div class="flex h-screen flex-col overflow-hidden">
+    <TitleBar />
 
-    <!-- Main Layout (Sidebar + Content) -->
-    <div class="flex-1 flex overflow-hidden p-3 gap-3 pt-0 pb-16 md:pb-3">
-      <!-- Left Sidebar (desktop only; mobile uses bottom tab bar) -->
-      <aside class="hidden md:flex w-60 bg-[#16191f] rounded-2xl p-4 flex-col justify-between border border-white/5 shadow-inner shrink-0">
-        <div class="space-y-6">
-          <!-- Logo / App Name -->
-          <div class="flex items-center gap-3">
-            <img 
-              src="/Telegram_logo.svg.webp" 
-              class="w-9 h-9 rounded-xl object-contain drop-shadow-[0_4px_12px_rgba(0,136,204,0.3)]" 
-              alt="TG WS Proxy" 
-            />
-            <h1 class="font-bold text-sm text-white tracking-wide">TG WS Proxy</h1>
-          </div>
+    <div class="flex min-h-0 flex-1 gap-3 px-3 pb-3">
+      <SideNav
+        v-model:active="activeTab"
+        v-model:collapsed="sidebarCollapsed"
+        @dc-test="runConnectivityTest"
+      />
 
-          <!-- Navigation Pills -->
-          <nav class="space-y-1.5">
-            <button 
-              @click="activeTab = 'main'"
-              :class="[
-                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
-                activeTab === 'main' 
-                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10' 
-                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
-              ]"
-            >
-              <Activity class="w-4 h-4" />
-              <span>Управление</span>
-            </button>
-
-            <button 
-              @click="activeTab = 'settings'"
-              :class="[
-                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
-                activeTab === 'settings' 
-                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10' 
-                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
-              ]"
-            >
-              <Settings class="w-4 h-4" />
-              <span>Настройки</span>
-            </button>
-
-            <button 
-              @click="activeTab = 'logs'"
-              :class="[
-                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
-                activeTab === 'logs' 
-                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10' 
-                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
-              ]"
-            >
-              <FileText class="w-4 h-4" />
-              <span>Логи</span>
-            </button>
-
-            <button
-              @click="activeTab = 'help'"
-              :class="[
-                'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium transition duration-200',
-                activeTab === 'help'
-                  ? 'bg-gradient-to-r from-[#2a303c] to-[#202530] text-white shadow-lg border border-white/10'
-                  : 'text-white/50 hover:text-white/80 hover:bg-white/5'
-              ]"
-            >
-              <CircleHelp class="w-4 h-4" />
-              <span>Помощь</span>
-            </button>
-
-            <button 
-              @click="runConnectivityTest"
-              :disabled="isTestingConnectivity"
-              class="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-medium text-white/60 hover:text-white hover:bg-white/5 transition border border-white/[0.04] cursor-pointer disabled:opacity-50 mt-2"
-              title="Проверить пинг и доступность DC1–DC5"
-            >
-              <Wifi class="w-4 h-4 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
-              <span>{{ isTestingConnectivity ? 'Проверка...' : 'Тест связности DC' }}</span>
-            </button>
-          </nav>
-        </div>
-
-        <!-- Sidebar Bottom Status Indicator -->
-        <div class="flex items-center gap-3 p-1">
-          <div :class="[
-            'w-2.5 h-2.5 rounded-full',
-            isRunning ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)] animate-pulse' : 'bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.8)]'
-          ]" />
-          <div>
-            <div class="text-xs font-semibold text-white/90">
-              {{ isRunning ? 'Мост активен' : 'Мост остановлен' }}
-            </div>
-            <div class="text-[11px] font-mono text-white/40">
-              {{ config.host }}:{{ config.port }}
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <!-- Right Main Content Area -->
-      <main class="flex-1 bg-[#16191f] rounded-2xl p-4 md:p-5 border border-white/5 shadow-inner overflow-y-auto">
-        <!-- New Version Update Banner -->
-        <div 
-          v-if="updateInfo && updateInfo.has_update" 
-          class="mb-4 bg-gradient-to-r from-blue-900/40 via-indigo-900/40 to-purple-900/40 border border-blue-500/30 rounded-2xl p-3.5 flex items-center justify-between shadow-lg shadow-blue-950/30 animate-pulse"
-        >
-          <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded-xl bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-blue-400">
-              <Download class="w-4 h-4" />
-            </div>
-            <div>
-              <div class="text-xs font-bold text-white">Доступна новая версия {{ updateInfo.latest_version }}!</div>
-              <div class="text-[10px] text-white/50">Текущая версия {{ updateInfo.current_version }}</div>
-            </div>
-          </div>
-          <button 
-            @click="invoke('open_url', { url: updateInfo.release_url })"
-            class="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-md transition cursor-pointer"
-          >
-            Скачать
-          </button>
-        </div>
-
-        <!-- VIEW 1: УПРАВЛЕНИЕ -->
-        <div v-if="activeTab === 'main'" class="space-y-4 max-w-2xl mx-auto">
-          <!-- Status Banner Card -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-5 shadow-lg flex items-center justify-between">
-            <div class="space-y-1">
-              <span :class="[
-                'text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5',
-                isRunning ? 'text-emerald-400' : 'text-rose-400'
-              ]">
-                <span :class="[
-                  'w-1.5 h-1.5 rounded-full animate-pulse',
-                  isRunning ? 'bg-emerald-400' : 'bg-rose-400'
-                ]"></span>
-                {{ isRunning ? 'СЕРВИС РАБОТАЕТ' : 'СЕРВИС ОСТАНОВЛЕН' }}
+      <main class="glass min-w-0 flex-1 overflow-y-auto rounded-2xl p-4 md:p-6">
+        <div class="mx-auto w-full max-w-3xl space-y-4">
+          <!-- Update banner -->
+          <div v-if="updateInfo?.has_update" class="update-banner">
+            <div class="flex min-w-0 items-center gap-3">
+              <span class="icon-chip h-8 w-8">
+                <Download class="h-4 w-4" />
               </span>
-              <h2 class="text-xl font-bold text-white tracking-tight">
-                {{ isRunning ? 'Локальный мост активен' : 'Мост не запущен' }}
-              </h2>
-              <p class="text-xs text-white/50 max-w-sm leading-relaxed">
-                MTProto WebSocket мост работает в фоновом режиме на {{ config.host }}:{{ config.port }} и маршрутизирует трафик в Telegram.
-              </p>
-            </div>
-
-            <!-- Start / Stop / Restart controls -->
-            <div class="flex flex-col items-end gap-2">
-              <div :class="[
-                'flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-xs font-semibold shadow-md',
-                isRunning
-                  ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 shadow-emerald-500/10'
-                  : 'bg-rose-500/10 border border-rose-500/20 text-rose-400 shadow-rose-500/10'
-              ]">
-                <span :class="[
-                  'w-2.5 h-2.5 rounded-full animate-pulse',
-                  isRunning ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.8)]'
-                ]"></span>
-                <span>{{ isRunning ? 'Мост работает' : 'Мост остановлен' }}</span>
-              </div>
-              <div class="flex items-center gap-2">
-                <button
-                  @click="restartProxy"
-                  :disabled="!isRunning"
-                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-white/80 text-xs font-medium transition border border-white/5 cursor-pointer disabled:opacity-40"
-                  title="Перезапустить прокси"
-                >
-                  <RefreshCw class="w-3.5 h-3.5" />
-                  <span>Рестарт</span>
-                </button>
-                <button
-                  @click="toggleProxy"
-                  :class="[
-                    'flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-md transition cursor-pointer active:scale-95',
-                    isRunning
-                      ? 'bg-rose-600/80 hover:bg-rose-500 text-white'
-                      : 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                  ]"
-                >
-                  <component :is="isRunning ? Square : Play" class="w-3.5 h-3.5" />
-                  <span>{{ isRunning ? 'Остановить' : 'Запустить' }}</span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 4 Telemetry Metrics Grid -->
-          <TelemetryGrid :telemetry="telemetry" />
-
-          <!-- Telegram Connection Link Card -->
-          <TgLinkCard :link="tgLink" />
-        </div>
-
-        <!-- VIEW 2: ПОЛНЫЕ НАСТРОЙКИ (С красивыми кастомными чекбоксами) -->
-        <div v-else-if="activeTab === 'settings'" class="space-y-4 max-w-2xl mx-auto pb-4">
-          <!-- 0. Presets -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Пресеты (в один клик)</div>
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-              <button
-                v-for="(p, id) in presets"
-                :key="id"
-                @click="applyPreset(id as PresetId)"
-                class="p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-blue-500/40 hover:bg-[#1a2030] transition text-left cursor-pointer active:scale-95 group"
-              >
-                <component :is="p.icon" class="w-4 h-4 text-blue-400 mb-1.5 group-hover:scale-110 transition" />
-                <div class="text-xs font-semibold text-white/90">{{ p.name }}</div>
-                <div class="text-[10px] text-white/40 mt-0.5 leading-snug">{{ p.desc }}</div>
-              </button>
-            </div>
-            <div class="text-[10px] text-white/30">Пресет подставляет значения в поля ниже — нажмите «Сохранить настройки», чтобы применить.</div>
-          </div>
-
-          <!-- 1. MTProto Connection Settings -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Подключение (MTProto)</div>
-            
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div class="col-span-2">
-                <label class="block text-[11px] text-white/40 mb-1">Хост</label>
-                <input 
-                  v-model="config.host" 
-                  class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs text-white outline-none focus:border-blue-500/50"
-                />
-              </div>
-              <div>
-                <label class="block text-[11px] text-white/40 mb-1">Порт</label>
-                <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition group">
-                  <input 
-                    type="number" 
-                    v-model.number="config.port" 
-                    class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                  />
-                  <div class="flex flex-col -mr-1">
-                    <button 
-                      type="button" 
-                      @click="config.port = Math.min(65535, (config.port || 0) + 1)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Увеличить порт"
-                    >
-                      <ChevronUp class="w-3 h-3" />
-                    </button>
-                    <button 
-                      type="button" 
-                      @click="config.port = Math.max(1, (config.port || 0) - 1)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Уменьшить порт"
-                    >
-                      <ChevronDown class="w-3 h-3" />
-                    </button>
-                  </div>
+              <div class="min-w-0">
+                <div class="text-xs font-bold text-white">
+                  Доступна новая версия {{ updateInfo.latest_version }}!
+                </div>
+                <div class="text-[10px] text-ink-2">
+                  Текущая версия {{ updateInfo.current_version }}
                 </div>
               </div>
             </div>
-
-            <div>
-              <label class="block text-[11px] text-white/40 mb-1">Секрет (16 байт в hex)</label>
-              <div class="flex gap-2">
-                <input 
-                  v-model="config.secret" 
-                  class="flex-1 bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
-                />
-                <button 
-                  @click="generateSecret"
-                  class="px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-white/80 text-xs flex items-center gap-1.5 transition border border-white/5"
-                  title="Сгенерировать случайный секрет"
-                >
-                  <RefreshCw class="w-3 h-3" />
-                  <span>Случайный</span>
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <label class="block text-[11px] text-white/40 mb-1">Целевые IP дата-центров (DC:IP перенаправление)</label>
-              <input 
-                v-model="dcRedirectsInput" 
-                placeholder="2: 149.154.167.220, 4: 149.154.167.220"
-                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
-              />
-              <div class="text-[10px] text-white/30 mt-1">Прямые IP адреса для маршрутизации трафика к серверам Telegram CDN</div>
-            </div>
-          </div>
-
-          <!-- 2. Cloudflare Proxy & Workers -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Cloudflare Прокси и Воркеры</div>
-            
-            <div class="space-y-2.5">
-              <!-- Toggle 1: Cloudflare Fallback -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Cloudflare Fallback</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Обход блокировок через сеть Cloudflare при сбоях прямого соединения</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.fallback_cfproxy = !config.fallback_cfproxy"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.fallback_cfproxy ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.fallback_cfproxy ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Toggle 2: H2 Media Multiplexing -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">HTTP/2 мультиплексирование</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Ускорение загрузки медиа, картинок, видео и файлов в Telegram</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.cfproxy_h2_media = !config.cfproxy_h2_media"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.cfproxy_h2_media ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.cfproxy_h2_media ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Toggle 3: Custom Domains -->
-              <div class="p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition space-y-2.5">
-                <div class="flex items-center justify-between">
-                  <div class="pr-3">
-                    <div class="text-xs font-semibold text-white/90">Собственные Cloudflare домены</div>
-                    <div class="text-[10px] text-white/40 mt-0.5">Маршрутизация трафика через пользовательские домены</div>
-                  </div>
-                  <button
-                    type="button"
-                    @click="config.cfproxy_user_domain_enabled = !config.cfproxy_user_domain_enabled"
-                    :class="[
-                      'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                      config.cfproxy_user_domain_enabled ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                    ]"
-                  >
-                    <div
-                      :class="[
-                        'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                        config.cfproxy_user_domain_enabled ? 'translate-x-4' : 'translate-x-0'
-                      ]"
-                    />
-                  </button>
-                </div>
-                <input 
-                  v-if="config.cfproxy_user_domain_enabled"
-                  v-model="userDomainsInput"
-                  placeholder="proxy.example.com, cdn.mysite.org"
-                  class="w-full bg-[#12151a] border border-white/10 rounded-xl px-3 py-1.5 text-xs text-white outline-none focus:border-blue-500/50 mt-1"
-                />
-              </div>
-
-              <!-- Toggle 4: Worker Domains -->
-              <div class="p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition space-y-2.5">
-                <div class="flex items-center justify-between">
-                  <div class="pr-3">
-                    <div class="text-xs font-semibold text-white/90">Cloudflare Worker воркеры</div>
-                    <div class="text-[10px] text-white/40 mt-0.5">Использование бессерверных воркеров Cloudflare Workers</div>
-                  </div>
-                  <button
-                    type="button"
-                    @click="config.cfproxy_worker_enabled = !config.cfproxy_worker_enabled"
-                    :class="[
-                      'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                      config.cfproxy_worker_enabled ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                    ]"
-                  >
-                    <div
-                      :class="[
-                        'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                        config.cfproxy_worker_enabled ? 'translate-x-4' : 'translate-x-0'
-                      ]"
-                    />
-                  </button>
-                </div>
-                <input 
-                  v-if="config.cfproxy_worker_enabled"
-                  v-model="workerDomainsInput"
-                  placeholder="my-worker.subdomain.workers.dev"
-                  class="w-full bg-[#12151a] border border-white/10 rounded-xl px-3 py-1.5 text-xs text-white outline-none focus:border-blue-500/50 mt-1"
-                />
-              </div>
-            </div>
-          </div>
-
-          <!-- 3. Transport (QUIC experimental) -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Транспорт <span class="text-amber-400/80 normal-case font-medium">· QUIC экспериментально</span></div>
-
-            <div>
-              <label class="block text-[11px] text-white/40 mb-1">Режим апстрима</label>
-              <select
-                v-model="config.transport"
-                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs text-white outline-none focus:border-blue-500/50 cursor-pointer"
-              >
-                <option value="auto">Авто (WS → QUIC → CF → TCP)</option>
-                <option value="ws">Только WebSocket</option>
-                <option value="quic">QUIC в первую очередь</option>
-              </select>
-            </div>
-
-            <div v-if="config.transport !== 'ws'">
-              <label class="block text-[11px] text-white/40 mb-1">QUIC-релеи (host:port, через запятую)</label>
-              <input
-                v-model="quicRelaysInput"
-                placeholder="relay.example.com:443"
-                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
-              />
-              <div class="text-[10px] text-white/30 mt-1">Свои UDP-релеи с ALPN tg-ws-proxy-quic-v1. Без релеев поведение как раньше. Ошибка — тихий фолбэк дальше по цепочке.</div>
-            </div>
-          </div>
-
-          <!-- 4. Masking & Fake TLS -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Маскировка (Fake TLS)</div>
-
-            <div>
-              <label class="block text-[11px] text-white/40 mb-1">SNI маскирующий домен (DPI bypass)</label>
-              <input 
-                v-model="config.fake_tls_domain" 
-                placeholder="например, cloudflare.com, yandex.ru"
-                class="w-full bg-[#12151a] border border-white/5 rounded-xl px-3 py-1.5 text-xs font-mono text-white outline-none focus:border-blue-500/50"
-              />
-            </div>
-
-            <!-- Toggle 5: PROXY Protocol v1 -->
-            <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-              <div class="pr-3">
-                <div class="text-xs font-semibold text-white/90">PROXY Protocol v1</div>
-                <div class="text-[10px] text-white/40 mt-0.5">Передача заголовка с реальным адресом клиента</div>
-              </div>
-              <button
-                type="button"
-                @click="config.proxy_protocol = !config.proxy_protocol"
-                :class="[
-                  'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                  config.proxy_protocol ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                ]"
-              >
-                <div
-                  :class="[
-                    'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                    config.proxy_protocol ? 'translate-x-4' : 'translate-x-0'
-                  ]"
-                />
-              </button>
-            </div>
-          </div>
-
-          <!-- 4. Advanced Connection Parameters & Autostart -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Система и оптимизация</div>
-
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label class="block text-[11px] text-white/40 mb-1">Буфер сокета (байт)</label>
-                <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition group">
-                  <input 
-                    type="number" 
-                    step="65536"
-                    v-model.number="config.buffer_size" 
-                    class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                  />
-                  <div class="flex flex-col -mr-1">
-                    <button 
-                      type="button" 
-                      @click="config.buffer_size = (config.buffer_size || 0) + 65536"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Увеличить буфер"
-                    >
-                      <ChevronUp class="w-3 h-3" />
-                    </button>
-                    <button 
-                      type="button" 
-                      @click="config.buffer_size = Math.max(4096, (config.buffer_size || 0) - 65536)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Уменьшить буфер"
-                    >
-                      <ChevronDown class="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div>
-                <label class="block text-[11px] text-white/40 mb-1">Размер пула сокетов</label>
-                <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition group">
-                  <input 
-                    type="number" 
-                    v-model.number="config.pool_size" 
-                    class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                  />
-                  <div class="flex flex-col -mr-1">
-                    <button 
-                      type="button" 
-                      @click="config.pool_size = Math.min(64, (config.pool_size || 0) + 1)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Увеличить размер пула"
-                    >
-                      <ChevronUp class="w-3 h-3" />
-                    </button>
-                    <button 
-                      type="button" 
-                      @click="config.pool_size = Math.max(0, (config.pool_size || 0) - 1)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Уменьшить размер пула"
-                    >
-                      <ChevronDown class="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div>
-                <label class="block text-[11px] text-white/40 mb-1">Лог файл (МБ)</label>
-                <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition group">
-                  <input 
-                    type="number" 
-                    v-model.number="config.log_max_mb" 
-                    class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                  />
-                  <div class="flex flex-col -mr-1">
-                    <button 
-                      type="button" 
-                      @click="config.log_max_mb = (config.log_max_mb || 0) + 1"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Увеличить размер логов"
-                    >
-                      <ChevronUp class="w-3 h-3" />
-                    </button>
-                    <button 
-                      type="button" 
-                      @click="config.log_max_mb = Math.max(1, (config.log_max_mb || 0) - 1)"
-                      class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      title="Уменьшить размер логов"
-                    >
-                      <ChevronDown class="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="space-y-2.5 pt-1">
-              <!-- Toggle 6: No Secure -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Режим No-Secure</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Порт 80 без SSL шифрования для CF proxy/worker</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.disable_secure = !config.disable_secure"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.disable_secure ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.disable_secure ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Toggle 7: Force Test DC -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Тестовые дата-центры Telegram</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Использовать Test DC для тестирования и разработки</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.force_test_dc = !config.force_test_dc"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.force_test_dc ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.force_test_dc ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Toggle 8: Verbose Logging -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Подробные логи (Verbose)</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Вывод расширенной отладочной информации в журнал</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.verbose = !config.verbose"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.verbose ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.verbose ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Toggle 9: Autostart switch -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Автозапуск с Windows</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Запускать мост в фоновом режиме при старте системы</div>
-                </div>
-                <button
-                  type="button"
-                  @click="toggleAutostart"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    autostartActive ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      autostartActive ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-
-              <!-- Action 1: DC Connectivity Test -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Тест связности дата-центров</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Проверить отклик и доступность серверов Telegram DC1–DC5</div>
-                </div>
-                <button
-                  type="button"
-                  @click="runConnectivityTest"
-                  :disabled="isTestingConnectivity"
-                  class="px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs font-medium text-white/90 flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
-                >
-                  <Wifi class="w-3.5 h-3.5 text-emerald-400" />
-                  <span>{{ isTestingConnectivity ? 'Тестирование...' : 'Запустить тест' }}</span>
-                </button>
-              </div>
-
-              <!-- Action 2: Update Check -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Обновления программы</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Текущая версия v{{ appVersion }}</div>
-                </div>
-                <button
-                  type="button"
-                  @click="checkForUpdates(true)"
-                  :disabled="isCheckingUpdate"
-                  class="px-3 py-1.5 rounded-xl bg-[#202530] hover:bg-[#2a3040] text-xs font-medium text-white/90 flex items-center gap-1.5 transition border border-white/5 cursor-pointer disabled:opacity-50"
-                >
-                  <RefreshCw class="w-3.5 h-3.5 text-blue-400" :class="isCheckingUpdate ? 'animate-spin' : ''" />
-                  <span>{{ isCheckingUpdate ? 'Проверка...' : 'Проверить' }}</span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 5. Advanced (hidden knobs) -->
-          <div class="bg-[#1c2027] border border-white/5 rounded-2xl p-4 space-y-3 shadow-md">
-            <button
-              @click="showAdvanced = !showAdvanced"
-              class="w-full flex items-center justify-between cursor-pointer"
-            >
-              <div class="text-[11px] font-bold text-white/60 uppercase tracking-wider">Продвинутые</div>
-              <component :is="showAdvanced ? ChevronUp : ChevronDown" class="w-4 h-4 text-white/40" />
-            </button>
-
-            <div v-if="showAdvanced" class="space-y-3">
-              <div class="grid grid-cols-2 gap-3">
-                <div>
-                  <label class="block text-[11px] text-white/40 mb-1">TTL сокета в пуле (сек)</label>
-                  <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition">
-                    <input
-                      type="number"
-                      step="10"
-                      v-model.number="config.pool_max_age_secs"
-                      class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                    />
-                    <div class="flex flex-col -mr-1">
-                      <button
-                        type="button"
-                        @click="config.pool_max_age_secs = (config.pool_max_age_secs || 0) + 10"
-                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      >
-                        <ChevronUp class="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        @click="config.pool_max_age_secs = Math.max(10, (config.pool_max_age_secs || 0) - 10)"
-                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      >
-                        <ChevronDown class="w-3 h-3" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div>
-                  <label class="block text-[11px] text-white/40 mb-1">Таймаут апстрима (сек)</label>
-                  <div class="relative flex items-center bg-[#12151a] border border-white/5 focus-within:border-blue-500/50 rounded-xl px-2.5 py-1 transition">
-                    <input
-                      type="number"
-                      v-model.number="config.connect_timeout_secs"
-                      class="w-full bg-transparent text-xs font-mono text-white outline-none"
-                    />
-                    <div class="flex flex-col -mr-1">
-                      <button
-                        type="button"
-                        @click="config.connect_timeout_secs = Math.min(120, (config.connect_timeout_secs || 0) + 1)"
-                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      >
-                        <ChevronUp class="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        @click="config.connect_timeout_secs = Math.max(2, (config.connect_timeout_secs || 0) - 1)"
-                        class="p-0.5 text-white/40 hover:text-white hover:bg-white/10 rounded transition cursor-pointer active:scale-90"
-                      >
-                        <ChevronDown class="w-3 h-3" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Splitter toggle -->
-              <div class="flex items-center justify-between p-3 rounded-xl bg-[#14171d]/60 border border-white/[0.04] hover:border-white/[0.08] transition">
-                <div class="pr-3">
-                  <div class="text-xs font-semibold text-white/90">Фрагментация пакетов (Splitter)</div>
-                  <div class="text-[10px] text-white/40 mt-0.5">Разбивка первых пакетов для обхода DPI; выключение ускоряет, но упрощает детект</div>
-                </div>
-                <button
-                  type="button"
-                  @click="config.splitter_enabled = !config.splitter_enabled"
-                  :class="[
-                    'w-10 h-6 flex items-center rounded-full p-0.5 transition-all duration-200 shrink-0 cursor-pointer',
-                    config.splitter_enabled ? 'bg-blue-600 shadow-sm shadow-blue-500/40 ring-1 ring-blue-400/30' : 'bg-[#202530] border border-white/10 hover:border-white/20'
-                  ]"
-                >
-                  <div
-                    :class="[
-                      'bg-white w-5 h-5 rounded-full shadow-md transform transition-all duration-200',
-                      config.splitter_enabled ? 'translate-x-4' : 'translate-x-0'
-                    ]"
-                  />
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Save Button -->
-          <div class="flex justify-end pt-2">
-            <button 
-              @click="saveSettings"
-              class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 text-white font-medium text-xs shadow-lg shadow-blue-500/20 transition cursor-pointer"
-            >
-              Сохранить настройки
+            <button class="btn btn-primary shrink-0" @click="openRelease">
+              Скачать
             </button>
           </div>
+
+          <Transition name="fade" mode="out-in">
+            <component :is="views[activeTab]" />
+          </Transition>
         </div>
-
-        <!-- VIEW 3: ЛОГИ МОСТА -->
-        <LogsView
-          v-else-if="activeTab === 'logs'"
-          @notify="showToast"
-          @notify-error="showError"
-        />
-
-        <!-- VIEW 4: ПОМОЩЬ -->
-        <GuidesView
-          v-else-if="activeTab === 'help'"
-          @go-main="activeTab = 'main'"
-          @rerun-onboarding="showWizard = true"
-        />
       </main>
     </div>
 
-    <!-- Mobile Bottom Tab Bar (md:hidden) -->
-    <nav class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#16191f]/95 backdrop-blur-md border-t border-white/5 flex items-center justify-around px-2 py-2">
+    <!-- Mobile bottom navigation -->
+    <nav class="glass-strong mx-3 mb-3 flex items-center justify-around rounded-2xl px-2 py-2 md:hidden">
       <button
-        v-for="t in [
-          { id: 'main', label: 'Мост', icon: Activity },
-          { id: 'settings', label: 'Настройки', icon: Settings },
-          { id: 'logs', label: 'Логи', icon: FileText },
-          { id: 'help', label: 'Помощь', icon: CircleHelp },
-        ]"
-        :key="t.id"
-        @click="activeTab = t.id as any"
-        :class="[
-          'flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[10px] font-medium transition cursor-pointer',
-          activeTab === t.id ? 'text-blue-400' : 'text-white/40'
-        ]"
+        v-for="item in mobileItems"
+        :key="item.id"
+        class="mobile-tab"
+        :class="{ active: activeTab === item.id }"
+        @click="activeTab = item.id"
       >
-        <component :is="t.icon" class="w-5 h-5" />
-        <span>{{ t.label }}</span>
+        <component :is="item.icon" class="h-5 w-5" />
+        <span>{{ item.label }}</span>
       </button>
       <button
-        @click="runConnectivityTest"
+        class="mobile-tab"
         :disabled="isTestingConnectivity"
-        class="flex flex-col items-center gap-0.5 px-3 py-1 rounded-xl text-[10px] font-medium transition cursor-pointer text-white/40 disabled:opacity-50"
+        @click="runConnectivityTest"
       >
-        <Wifi class="w-5 h-5 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
-        <span>{{ isTestingConnectivity ? 'Тест...' : 'DC' }}</span>
+        <Wifi class="h-5 w-5 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
+        <span>{{ isTestingConnectivity ? 'Тест…' : 'DC' }}</span>
       </button>
     </nav>
 
-    <!-- Connectivity Test Modal Dialog -->
+    <!-- Overlays -->
     <DcTestModal
       :show="showTestModal"
       :testing="isTestingConnectivity"
@@ -1310,60 +134,47 @@ onMounted(async () => {
       @retry="runConnectivityTest"
     />
 
-    <!-- Floating Toast Notification -->
-    <transition
-      enter-active-class="transition duration-300 ease-out transform"
-      enter-from-class="opacity-0 translate-y-3 scale-95"
-      enter-to-class="opacity-100 translate-y-0 scale-100"
-      leave-active-class="transition duration-200 ease-in transform"
-      leave-from-class="opacity-100 translate-y-0 scale-100"
-      leave-to-class="opacity-0 translate-y-2 scale-95"
-    >
-      <div 
-        v-if="toast.show" 
-        class="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-2.5 rounded-xl bg-[#1b212c] border border-emerald-500/30 text-white text-xs shadow-2xl shadow-black/80 ring-1 ring-emerald-500/20 backdrop-blur-md"
-      >
-        <div class="w-5 h-5 rounded-full bg-emerald-500/20 flex items-center justify-center text-emerald-400">
-          <Check class="w-3.5 h-3.5 stroke-[3]" />
-        </div>
-        <span class="font-medium text-white/90">{{ toast.message }}</span>
-      </div>
-    </transition>
-
-    <!-- Floating Error Toast (port busy, start failures) -->
-    <transition
-      enter-active-class="transition duration-300 ease-out transform"
-      enter-from-class="opacity-0 translate-y-3 scale-95"
-      enter-to-class="opacity-100 translate-y-0 scale-100"
-      leave-active-class="transition duration-200 ease-in transform"
-      leave-from-class="opacity-100 translate-y-0 scale-100"
-      leave-to-class="opacity-0 translate-y-2 scale-95"
-    >
-      <div 
-        v-if="errorToast.show" 
-        class="fixed bottom-6 left-6 z-50 flex items-center gap-3 px-4 py-2.5 rounded-xl bg-[#241418] border border-rose-500/40 text-white text-xs shadow-2xl shadow-black/80 ring-1 ring-rose-500/20 backdrop-blur-md max-w-md"
-      >
-        <div class="w-5 h-5 shrink-0 rounded-full bg-rose-500/20 flex items-center justify-center text-rose-400">
-          <AlertCircle class="w-3.5 h-3.5" />
-        </div>
-        <span class="font-medium text-white/90 flex-1">{{ errorToast.message }}</span>
-        <button
-          @click="errorToast.show = false; activeTab = 'settings'"
-          class="shrink-0 px-2.5 py-1 rounded-lg bg-rose-600/30 hover:bg-rose-600/50 border border-rose-500/30 text-rose-200 transition cursor-pointer"
-        >
-          Настройки
-        </button>
-      </div>
-    </transition>
-
-    <!-- Onboarding Wizard (first run) -->
     <OnboardingWizard
-      v-if="showWizard"
-      :link="tgLink"
-      :initial-port="config.port"
-      :initial-secret="config.secret"
-      @apply="applyOnboarding"
+      :show="showWizard"
       @close="showWizard = false"
     />
+
+    <ToastHost />
   </div>
 </template>
+
+<style scoped>
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.16s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.mobile-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.35rem 0.8rem;
+  border-radius: 0.8rem;
+  font-size: 0.6rem;
+  font-weight: 500;
+  color: var(--color-ink-3);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.mobile-tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mobile-tab.active {
+  color: #5bc5f5;
+  background: rgba(42, 171, 238, 0.12);
+}
+</style>
