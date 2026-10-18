@@ -26,8 +26,10 @@ jobs:
             echo "::error file=$FILE::CHANGELOG.md is missing"
             exit 1
           fi
+          # Built with index(), not a regex: the version contains `[`, `.` and
+          # `]`, which are all metacharacters.
           BODY="$(awk -v want="[$VERSION]" '
-            $0 ~ "^## \\["want"]" { capture = 1; next }
+            index($0, "## " want) == 1 { capture = 1; next }
             capture && /^## / { capture = 0 }
             capture { print }
           ' "$FILE" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
