@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-gui"
-version = "0.4.0"
+version = "1.0.0"
 description = "Telegram Desktop WebSocket Proxy GUI"
 authors = ["nsvl"]
 license = "MIT"
@@ -25,6 +25,9 @@ log = "0.4"
 tauri = { version = "2.12.1", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-clipboard-manager = "2"
+# Cross-platform "open URL / file": replaces the hand-rolled ShellExecuteW /
+# xdg-open code and is the only variant that also works on Android & iOS.
+tauri-plugin-opener = "2"
 tg-ws-proxy-core = { path = "./core" }
 tokio = { version = "1.43", features = ["full"] }
 # Explicit crypto provider selection at startup (see src/main.rs).

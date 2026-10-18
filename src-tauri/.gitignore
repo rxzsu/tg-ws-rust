@@ -2,3 +2,9 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+# Android project: keep sources, drop build output
+/gen/android/**/build/
+/gen/android/.gradle/
+/gen/android/.cxx/
+/gen/android/local.properties
+/gen/android/app/src/main/jniLibs/

@@ -112,6 +112,8 @@ pub struct WsReader {
 pub struct WsWriter {
     writer: WriteHalf<WsStream>,
     closed: bool,
+    /// Scratch buffer for `send_batch`, reused across calls.
+    batch: Vec<u8>,
 }
 
 impl RawWebSocket {
@@ -222,6 +224,18 @@ impl RawWebSocket {
         self.stream.shutdown().await
     }
 
+    /// Keep-alive ping for pooled sockets.
+    ///
+    /// Writes and flushes a real WS ping frame, so it works for TLS streams
+    /// too (a `try_write` shortcut is impossible through rustls, and skipping
+    /// TLS sockets would let Cloudflare/ISP idle timeouts kill exactly the
+    /// connections we paid a handshake for).
+    pub async fn ping(&mut self) -> std::io::Result<()> {
+        let frame = build_frame(OP_PING, b"ka", true);
+        self.stream.write_all(&frame).await?;
+        self.stream.flush().await
+    }
+
     pub fn split(self) -> (WsReader, WsWriter) {
         let (reader, writer) = tokio::io::split(self.stream);
         (
@@ -234,6 +248,7 @@ impl RawWebSocket {
             WsWriter {
                 writer,
                 closed: false,
+                batch: Vec::new(),
             },
         )
     }
@@ -253,14 +268,21 @@ impl WsWriter {
         if self.closed {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "WebSocket closed"));
         }
+        // One reusable buffer per writer instead of a fresh Vec per batch.
+        let mut batch = std::mem::take(&mut self.batch);
+        batch.clear();
         let total_size: usize = parts.iter().map(|p| p.len() + 14).sum();
-        let mut batch = Vec::with_capacity(total_size);
+        batch.reserve(total_size);
         for part in parts {
-            let frame = build_frame(OP_BINARY, part, true);
-            batch.extend_from_slice(&frame);
+            encode_frame(&mut batch, OP_BINARY, part, true);
         }
-        self.writer.write_all(&batch).await?;
-        self.writer.flush().await
+        let res = match self.writer.write_all(&batch).await {
+            Ok(()) => self.writer.flush().await,
+            Err(e) => Err(e),
+        };
+        // Keep the allocation for the next batch, even on write errors.
+        self.batch = batch;
+        res
     }
 
     pub async fn close(&mut self) -> std::io::Result<()> {
@@ -277,12 +299,27 @@ impl WsWriter {
 
 impl WsReader {
     pub async fn recv(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        if self.recv_into(&mut buf).await? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Receive the next message into `out`, reusing its allocation.
+    ///
+    /// The bridge keeps one buffer per session, so media streaming does not
+    /// allocate a fresh `Vec` for every frame. Returns `Ok(false)` when the
+    /// peer closed the stream.
+    pub async fn recv_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<bool> {
         while !self.closed {
-            let (opcode, payload, fin) = self.read_frame().await?;
+            out.clear();
+            let (opcode, fin) = self.read_frame_into(out).await?;
 
             if opcode == OP_CLOSE {
                 self.closed = true;
-                return Ok(None);
+                return Ok(false);
             }
 
             if opcode == OP_PING || opcode == OP_PONG {
@@ -291,9 +328,9 @@ impl WsReader {
 
             if opcode == OP_CONT || opcode == OP_TEXT || opcode == OP_BINARY {
                 if fin && self.frag.is_empty() {
-                    return Ok(Some(payload));
+                    return Ok(true);
                 }
-                self.frag.extend_from_slice(&payload);
+                self.frag.extend_from_slice(out);
                 if self.frag.len() > MAX_MESSAGE_LEN {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -303,11 +340,14 @@ impl WsReader {
                 if !fin {
                     continue;
                 }
-                let msg = std::mem::take(&mut self.frag);
-                return Ok(Some(msg));
+                // Hand the assembled message to the caller and keep the
+                // scratch allocation for the next fragmented frame.
+                std::mem::swap(&mut self.frag, out);
+                self.frag.clear();
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     async fn read_exact_buffered(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
@@ -329,7 +369,7 @@ impl WsReader {
         Ok(())
     }
 
-    async fn read_frame(&mut self) -> std::io::Result<(u8, Vec<u8>, bool)> {
+    async fn read_frame_into(&mut self, payload: &mut Vec<u8>) -> std::io::Result<(u8, bool)> {
         let mut hdr = [0u8; 2];
         self.read_exact_buffered(&mut hdr).await?;
 
@@ -365,53 +405,53 @@ impl WsReader {
             None
         };
 
-        let mut payload = vec![0u8; length];
-        self.read_exact_buffered(&mut payload).await?;
+        // Reuse the caller's allocation: `resize` only grows when the frame
+        // is larger than the current capacity.
+        payload.clear();
+        payload.resize(length, 0);
+        self.read_exact_buffered(payload).await?;
 
         if let Some(mask) = mask_key {
-            xor_mask(&mut payload, &mask);
+            xor_mask(payload, &mask);
         }
 
-        Ok((opcode, payload, fin))
+        Ok((opcode, fin))
     }
 }
 
 fn build_frame(opcode: u8, data: &[u8], mask: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(14 + data.len());
+    encode_frame(&mut buf, opcode, data, mask);
+    buf
+}
+
+/// Append one frame to `out` in place (no intermediate `Vec`, no extra copy
+/// beyond the mandatory masking pass).
+fn encode_frame(out: &mut Vec<u8>, opcode: u8, data: &[u8], mask: bool) {
     let length = data.len();
-    let fb = 0x80 | opcode;
-    let mut buf = Vec::with_capacity(14 + length);
-    buf.push(fb);
+    out.push(0x80 | opcode);
 
-    if !mask {
-        if length < 126 {
-            buf.push(length as u8);
-        } else if length < 65536 {
-            buf.push(126);
-            buf.extend_from_slice(&(length as u16).to_be_bytes());
-        } else {
-            buf.push(127);
-            buf.extend_from_slice(&(length as u64).to_be_bytes());
-        }
-        buf.extend_from_slice(data);
+    let mask_bit = if mask { 0x80 } else { 0 };
+    if length < 126 {
+        out.push(mask_bit | (length as u8));
+    } else if length < 65536 {
+        out.push(mask_bit | 126);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
     } else {
-        let mut mask_key = [0u8; 4];
-        rand::rng().fill(&mut mask_key);
-
-        if length < 126 {
-            buf.push(0x80 | (length as u8));
-        } else if length < 65536 {
-            buf.push(0x80 | 126);
-            buf.extend_from_slice(&(length as u16).to_be_bytes());
-        } else {
-            buf.push(0x80 | 127);
-            buf.extend_from_slice(&(length as u64).to_be_bytes());
-        }
-        buf.extend_from_slice(&mask_key);
-
-        let mut masked = data.to_vec();
-        xor_mask(&mut masked, &mask_key);
-        buf.extend_from_slice(&masked);
+        out.push(mask_bit | 127);
+        out.extend_from_slice(&(length as u64).to_be_bytes());
     }
 
-    buf
+    if !mask {
+        out.extend_from_slice(data);
+        return;
+    }
+
+    let mut mask_key = [0u8; 4];
+    rand::rng().fill(&mut mask_key);
+    out.extend_from_slice(&mask_key);
+
+    let start = out.len();
+    out.extend_from_slice(data);
+    xor_mask(&mut out[start..], &mask_key);
 }

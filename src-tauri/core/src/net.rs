@@ -12,7 +12,7 @@ pub fn clamp_io_buf(n: usize) -> usize {
     n.clamp(4096, 1024 * 1024)
 }
 
-fn apply_buf(sock: &socket2::Socket, io_buf: usize) {
+fn apply_buf(sock: &socket2::SockRef<'_>, io_buf: usize) {
     let buf = clamp_io_buf(io_buf);
     if let Err(e) = sock.set_recv_buffer_size(buf) {
         tracing::debug!("set_recv_buffer_size({}) failed: {:?}", buf, e);
@@ -43,6 +43,13 @@ pub async fn bind_listener(host: &str, port: u16) -> io::Result<TcpListener> {
         socket2::Domain::IPV6
     };
     let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // SO_REUSEADDR means two different things per platform. On Unix it only
+    // skips TIME_WAIT, which is what we want for instant restarts. On Windows
+    // it lets a *second* socket bind an address that is already listening —
+    // two proxy instances then split incoming connections unpredictably, and
+    // the "port busy" diagnostic never fires. Windows keeps its default
+    // exclusive behaviour instead.
+    #[cfg(not(windows))]
     sock.set_reuse_address(true)?;
     sock.bind(&addr.into())?;
     sock.listen(1024)?;
@@ -66,11 +73,11 @@ pub async fn tcp_connect(host: &str, port: u16, io_buf: usize) -> io::Result<Tcp
 /// Apply kernel buffer sizes to an already-accepted client stream.
 pub fn tune_accepted(stream: TcpStream, io_buf: usize) -> io::Result<TcpStream> {
     let std_stream = stream.into_std()?;
-    let sock = socket2::Socket::from(std_stream);
-    let _ = sock.set_nodelay(true);
+    let sock = socket2::SockRef::from(&std_stream);
+    let _ = sock.set_tcp_nodelay(true);
     apply_buf(&sock, io_buf);
     sock.set_nonblocking(true)?;
-    TcpStream::from_std(sock.into())
+    TcpStream::from_std(std_stream)
 }
 
 #[cfg(test)]

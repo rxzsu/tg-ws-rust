@@ -3,12 +3,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(desktop)]
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
 };
+#[cfg(desktop)]
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
 use tg_ws_proxy_core::config::ProxyConfig;
 use tg_ws_proxy_core::logging as core_logging;
 use tg_ws_proxy_core::stats::Stats;
@@ -90,6 +93,8 @@ fn sensitive_domains_of(cfg: &ProxyConfig) -> Vec<String> {
     out
 }
 
+#[cfg(desktop)]
+#[cfg(desktop)]
 async fn current_tg_link(state: &Arc<AppState>) -> String {
     let cfg = state.config.lock().await;
     generate_tg_link(&cfg)
@@ -116,76 +121,24 @@ fn spawn_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
     });
 }
 
-fn open_url_native(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut std::ffi::c_void,
-                lpOperation: *const u16,
-                lpFile: *const u16,
-                lpParameters: *const u16,
-                lpDirectory: *const u16,
-                nShowCmd: i32,
-            ) -> isize;
-        }
-
-        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(std::iter::once(0)).collect();
-        let op_wide: Vec<u16> = OsStr::new("open").encode_wide().chain(std::iter::once(0)).collect();
-
-        let res = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                op_wide.as_ptr(),
-                url_wide.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1, // SW_SHOWNORMAL
-            )
-        };
-
-        if res <= 32 {
-            // If direct ShellExecuteW failed, try t.me web redirect fallback
-            let alt_url = if url.starts_with("tg://proxy?") {
-                url.replace("tg://proxy?", "https://t.me/proxy?")
-            } else {
-                url.to_string()
-            };
-            let alt_wide: Vec<u16> = OsStr::new(&alt_url).encode_wide().chain(std::iter::once(0)).collect();
-            let alt_res = unsafe {
-                ShellExecuteW(
-                    std::ptr::null_mut(),
-                    op_wide.as_ptr(),
-                    alt_wide.as_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    1,
-                )
-            };
-            if alt_res <= 32 {
-                let ps_cmd = format!("Start-Process '{}'", alt_url.replace("'", "''"));
-                let _ = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-                    .spawn();
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
-}
-
+#[cfg(desktop)]
+#[cfg(desktop)]
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        // Window state APIs are desktop-only.
+        #[cfg(desktop)]
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+/// Host platform: `android` / `ios` / `windows` / `macos` / `linux`.
+/// The frontend uses it to hide desktop-only chrome (window buttons,
+/// autostart, tray hints) instead of guessing from the user agent.
+#[tauri::command]
+fn get_platform() -> &'static str {
+    std::env::consts::OS
 }
 
 #[tauri::command]
@@ -200,6 +153,11 @@ async fn save_config(
     new_config: ProxyConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if let Err(msg) = tg_ws_proxy_core::config::validate(&new_config) {
+        log::error!("Config rejected: {}", msg);
+        return Err(msg);
+    }
+
     {
         let mut cfg = state.config.lock().await;
         *cfg = new_config.clone();
@@ -239,6 +197,13 @@ async fn is_running(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     Ok(state.running.load(Ordering::SeqCst))
 }
 
+/// Dismiss the "last error" banner without restarting the bridge.
+#[tauri::command]
+async fn clear_last_error(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.stats.clear_last_error();
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
     if state.running.load(Ordering::SeqCst) {
@@ -249,6 +214,14 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
         let guard = state.config.lock().await;
         guard.clone()
     };
+
+    // Refuse to start with a config that cannot work, instead of binding a
+    // random port or deriving an all-zero key from a mistyped secret.
+    if let Err(msg) = tg_ws_proxy_core::config::validate(&cfg) {
+        log::error!("Start refused: {}", msg);
+        let _ = app.emit("proxy-error", msg.clone());
+        return Err(msg);
+    }
 
     // Pre-flight check port binding with diagnostic mapping
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -273,6 +246,7 @@ async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     }
     state.running.store(false, Ordering::SeqCst);
     state.stats.connections_active.store(0, Ordering::SeqCst);
+    state.stats.mark_stopped();
     Ok(())
 }
 
@@ -299,22 +273,9 @@ async fn open_log_file(app: AppHandle) -> Result<(), String> {
     if !path.exists() {
         let _ = fs::write(&path, "");
     }
-    let p_str = path.to_string_lossy().to_string();
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("Start-Process '{}'", p_str.replace("'", "''"))])
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(&p_str).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(&p_str).spawn();
-    }
-    Ok(())
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("Не удалось открыть лог: {e}"))
 }
 
 #[tauri::command]
@@ -325,9 +286,10 @@ async fn clear_logs(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_url(url: String) -> Result<(), String> {
-    open_url_native(&url);
-    Ok(())
+async fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("Не удалось открыть ссылку: {e}"))
 }
 
 #[tauri::command]
@@ -372,14 +334,20 @@ fn is_first_run(app: AppHandle) -> bool {
 
 #[tauri::command]
 async fn minimize_window(app: AppHandle) -> Result<(), String> {
+    // Window state APIs exist on desktop only; mobile keeps the command
+    // registered so the shared frontend can call it unconditionally.
+    #[cfg(desktop)]
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.minimize();
     }
+    #[cfg(mobile)]
+    let _ = app;
     Ok(())
 }
 
 #[tauri::command]
 async fn toggle_maximize_window(app: AppHandle) -> Result<(), String> {
+    #[cfg(desktop)]
     if let Some(w) = app.get_webview_window("main") {
         if w.is_maximized().unwrap_or(false) {
             let _ = w.unmaximize();
@@ -387,14 +355,19 @@ async fn toggle_maximize_window(app: AppHandle) -> Result<(), String> {
             let _ = w.maximize();
         }
     }
+    #[cfg(mobile)]
+    let _ = app;
     Ok(())
 }
 
 #[tauri::command]
 async fn close_window(app: AppHandle) -> Result<(), String> {
+    #[cfg(desktop)]
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.hide();
     }
+    #[cfg(mobile)]
+    let _ = app;
     Ok(())
 }
 
@@ -526,15 +499,23 @@ pub fn run() {
         shutdown_tx: Mutex::new(None),
     });
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(state.clone());
+
+    // Autostart and single-instance are desktop-only (the crates themselves
+    // are only pulled in for non-mobile targets in Cargo.toml).
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the already running window instead of
             // conflicting over the proxy port (Single-Instance Guard).
             show_main_window(app);
-        }))
-        .manage(state.clone())
+        }));
+
+    builder
         .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -645,6 +626,9 @@ pub fn run() {
                 }
             });
 
+            // Tray is desktop-only: Android/iOS have no tray API at all.
+            #[cfg(desktop)]
+            {
             // Create Tray Menu (full quick actions, no need to open the window)
             let open_tg_i = MenuItem::with_id(app, "open_tg", "Открыть в Telegram", true, None::<&str>)?;
             let copy_link_i =
@@ -693,7 +677,9 @@ pub fn run() {
                             let st = app.state::<Arc<AppState>>();
                             current_tg_link(st.inner()).await
                         });
-                        open_url_native(&link);
+                        if let Err(e) = app.opener().open_url(link, None::<&str>) {
+                            log::warn!("Tray open link failed: {:?}", e);
+                        }
                     }
                     "copy_link" => {
                         let link = tauri::async_runtime::block_on(async {
@@ -736,7 +722,7 @@ pub fn run() {
                         if !path.exists() {
                             let _ = fs::write(&path, "");
                         }
-                        open_url_native(&path.to_string_lossy());
+                        let _ = app.opener().open_path(path.to_string_lossy(), None::<&str>);
                     }
                     _ => {}
                 })
@@ -756,6 +742,7 @@ pub fn run() {
                 tray_builder = tray_builder.icon(icon);
             }
             let _tray = tray_builder.build(app)?;
+            }
 
             Ok(())
         })
@@ -763,10 +750,12 @@ pub fn run() {
             get_config,
             save_config,
             is_running,
+            clear_last_error,
             start_proxy,
             stop_proxy,
             restart_proxy,
             get_app_version,
+            get_platform,
             is_first_run,
             get_link_host,
             get_recent_logs,

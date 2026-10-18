@@ -16,6 +16,33 @@ pub struct MsgSplitter {
     /// instead of `drain`ing on every call.
     head: usize,
     disabled: bool,
+    /// Whether the first packet has already been emitted. Only the first
+    /// (most fingerprintable) packet of the session gets randomized
+    /// sub-fragmentation.
+    first_packet_done: bool,
+}
+
+/// Randomize the fragmentation of the first packet: emit its first chunk
+/// as 1..=7 separate sub-frames with random boundaries inside the first
+/// `win` bytes. Returns boundaries relative to `packet`.
+fn randomized_fragment_boundaries(packet: &[u8]) -> Vec<usize> {
+    use rand::RngExt;
+    // Nothing to cut: a single-byte packet stays intact.
+    if packet.len() < 2 {
+        return Vec::new();
+    }
+    let mut rng = rand::rng();
+    let win = packet.len().min(96);
+    let n_cuts = rng.random_range(1..=3);
+    let mut cuts: Vec<usize> = Vec::with_capacity(n_cuts as usize);
+    for _ in 0..n_cuts {
+        let c = rng.random_range(1..win);
+        if !cuts.contains(&c) {
+            cuts.push(c);
+        }
+    }
+    cuts.sort_unstable();
+    cuts
 }
 
 impl MsgSplitter {
@@ -36,6 +63,7 @@ impl MsgSplitter {
             plain_buf: Vec::with_capacity(8192),
             head: 0,
             disabled: false,
+            first_packet_done: false,
         }
     }
 
@@ -90,7 +118,33 @@ impl MsgSplitter {
         self.head = offset;
 
         let buf = &self.cipher_buf;
-        ranges.into_iter().map(|(s, e)| &buf[s..e]).collect()
+        let mut slices: Vec<&[u8]> = ranges.iter().map(|(s, e)| &buf[*s..*e]).collect();
+
+        // Adaptive DPI evasion: the very first packet of the session gets
+        // randomized sub-fragmentation. Everything after stays protocol-
+        // correct (frames are still exact packet boundaries — Telegram's
+        // WS endpoint accepts both fragmented and single-frame writes).
+        if !self.first_packet_done && !slices.is_empty() {
+            let first = slices[0];
+            let bounds = randomized_fragment_boundaries(first);
+            let start = ranges[0].0;
+            let mut frag: Vec<&[u8]> = Vec::with_capacity(bounds.len() + 1);
+            let mut prev = 0usize;
+            for b in &bounds {
+                frag.push(&buf[start + prev..start + b]);
+                prev = *b;
+            }
+            frag.push(&buf[start + prev..start + first.len()]);
+            // Replace the first slice with the fragmented pieces: keeping the
+            // whole packet in the list as well would send those bytes twice.
+            let mut rest = slices.split_off(1);
+            let mut out = frag;
+            out.append(&mut rest);
+            slices = out;
+            self.first_packet_done = true;
+        }
+
+        slices
     }
 
     /// Drop the consumed prefix. Runs at the start of the next call, when
@@ -220,6 +274,11 @@ mod tests {
         ct
     }
 
+    /// Flatten emitted frames back into the original byte stream.
+    fn join(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|p| p.iter().copied()).collect()
+    }
+
     #[test]
     fn split_complete_packets_roundtrip() {
         let relay_init = [0x42u8; 64];
@@ -233,9 +292,11 @@ mod tests {
 
         let mut sp = MsgSplitter::new(&relay_init, PROTO_ABRIDGED_INT);
         let parts = sp.split(&ct);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], &ct[0..5]);
-        assert_eq!(parts[1], &ct[5..14]);
+        assert!(parts.len() >= 2, "expected at least two frames");
+        // The first packet is deliberately sub-fragmented, but concatenating
+        // every frame must reproduce the ciphertext byte for byte.
+        let joined: Vec<u8> = join(&parts);
+        assert_eq!(joined, ct);
         // Nothing left: second call yields nothing.
         assert!(sp.split(&[]).is_empty());
         assert!(sp.flush().is_none());
@@ -253,8 +314,38 @@ mod tests {
         assert!(sp.split(&ct[..3]).is_empty());
         // Remaining bytes complete the packet.
         let parts = sp.split(&ct[3..]);
+        assert_eq!(join(&parts), ct);
+    }
+
+    #[test]
+    fn first_packet_fragments_do_not_duplicate_bytes() {
+        let relay_init = [0x11u8; 64];
+        let mut enc = test_encryptor(&relay_init);
+        let plain: Vec<u8> = vec![0x02, 1, 2, 3, 4, 5, 6, 7, 8];
+        let ct = encrypt(&mut enc, &plain);
+
+        let mut sp = MsgSplitter::new(&relay_init, PROTO_ABRIDGED_INT);
+        let parts = sp.split(&ct);
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        assert_eq!(total, ct.len(), "fragmentation must not duplicate the first packet");
+        assert_eq!(join(&parts), ct);
+    }
+
+    #[test]
+    fn later_packets_are_not_fragmented() {
+        let relay_init = [0x22u8; 64];
+        let mut enc = test_encryptor(&relay_init);
+        let first: Vec<u8> = vec![0x01, 1, 2, 3, 4];
+        let second: Vec<u8> = vec![0x01, 5, 6, 7, 8];
+        let ct_first = encrypt(&mut enc, &first);
+        let ct_second = encrypt(&mut enc, &second);
+
+        let mut sp = MsgSplitter::new(&relay_init, PROTO_ABRIDGED_INT);
+        assert_eq!(join(&sp.split(&ct_first)), ct_first);
+        // Second packet is emitted as a single frame (no extra splitting).
+        let parts = sp.split(&ct_second);
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0], &ct[..]);
+        assert_eq!(parts[0], &ct_second[..]);
     }
 
     #[test]

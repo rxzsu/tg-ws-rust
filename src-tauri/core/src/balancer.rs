@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use rand::seq::SliceRandom;
 use rand::prelude::IndexedRandom;
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -45,6 +45,8 @@ pub fn get_default_cf_domains() -> Vec<String> {
 pub struct Balancer {
     domains: Arc<RwLock<Vec<String>>>,
     dc_to_domain: Arc<RwLock<HashMap<i32, String>>>,
+    /// Measured health per balancer domain (RTT in µs, None = failed probe).
+    health: Arc<RwLock<HashMap<String, Option<u128>>>>,
 }
 
 impl Default for Balancer {
@@ -66,6 +68,7 @@ impl Balancer {
         Self {
             domains: Arc::new(RwLock::new(defaults)),
             dc_to_domain: Arc::new(RwLock::new(dc_map)),
+            health: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -85,38 +88,135 @@ impl Balancer {
         }
     }
 
+    /// Domains for a DC ordered by measured health: fastest first, then
+    /// unknown (never probed) domains, then dead ones. Falls back to random
+    /// order inside each tier so we still spread the load.
     pub async fn get_domains_for_dc(&self, dc: i32) -> Vec<String> {
-        let dc_guard = self.dc_to_domain.read().await;
         let d_guard = self.domains.read().await;
+        let health = self.health.read().await;
 
-        let current = dc_guard.get(&dc).cloned();
-        let mut list = Vec::new();
-        if let Some(c) = current.clone() {
-            list.push(c);
-        }
+        let mut scored: Vec<(u8, u64, String)> = d_guard
+            .iter()
+            .map(|d| {
+                let (tier, rtt) = match health.get(d) {
+                    // Measured healthy: ordered by RTT, fastest first.
+                    Some(Some(us)) => (0u8, (*us).min(u64::MAX as u128) as u64),
+                    // Never probed: still worth trying, but behind known-good.
+                    None => (1, rand::rng().random_range(0..1_000_000)),
+                    // Explicitly failed: last resort.
+                    Some(None) => (2, 0),
+                };
+                (tier, rtt, d.clone())
+            })
+            .collect();
+        drop(d_guard);
+        drop(health);
 
-        let mut shuffled = d_guard.clone();
-        shuffled.shuffle(&mut rand::rng());
-        for d in shuffled {
-            if Some(&d) != current.as_ref() {
-                list.push(d);
+        scored.sort_by_key(|(tier, rtt, _)| (*tier, *rtt));
+
+        let mut list: Vec<String> = scored.into_iter().map(|(_, _, d)| d).collect();
+
+        // Current domain for this DC stays first: switching costs a handshake.
+        let current = self.dc_to_domain.read().await.get(&dc).cloned();
+        if let Some(c) = current {
+            if let Some(pos) = list.iter().position(|d| *d == c) {
+                list.remove(pos);
             }
+            list.insert(0, c);
         }
         list
     }
 
+    /// Pick the next domain for a DC, preferring healthy ones.
     pub async fn rotate_domain_for_dc(&self, dc: i32) {
-        let d_guard = self.domains.read().await;
+        let ordered = self.get_domains_for_dc(dc).await;
         let mut dc_guard = self.dc_to_domain.write().await;
-
-        let current = dc_guard.get(&dc);
-        let alternatives: Vec<_> = d_guard.iter().filter(|d| Some(*d) != current).collect();
-        if let Some(chosen) = alternatives.as_slice().choose(&mut rand::rng()) {
-            dc_guard.insert(dc, (*chosen).clone());
+        // Rotate past the current pick into the health-ordered list.
+        let current = dc_guard.get(&dc).cloned();
+        let candidates: Vec<_> = ordered
+            .into_iter()
+            .filter(|d| Some(d) != current.as_ref())
+            .collect();
+        if let Some(chosen) = candidates.first() {
+            dc_guard.insert(dc, chosen.clone());
         }
     }
 
+    /// Record a successful connect with its measured RTT (TLS handshake +
+    /// WS upgrade). Overrides both failures and stale probe data.
+    pub async fn record_success(&self, domain: &str, rtt_us: u128) {
+        let mut health = self.health.write().await;
+        health.insert(domain.to_string(), Some(rtt_us));
+    }
+
+    /// Mark a domain as failed right now (connection refused, RST, timeout,
+    /// TLS error). Pushes it to the back of the health ordering immediately
+    /// instead of waiting for the next probe round.
+    pub async fn record_failure(&self, domain: &str) {
+        let mut health = self.health.write().await;
+        health.insert(domain.to_string(), None);
+    }
+
+    /// One probe round: TLS handshake + WS upgrade to every domain, record
+    /// RTT. Runs in the background on a timer; results feed the ordering in
+    /// `get_domains_for_dc`.
+    async fn probe_all(&self) {
+        let domains = self.domains.read().await.clone();
+        let mut handles = Vec::with_capacity(domains.len());
+        for d in domains {
+            handles.push(tokio::spawn(async move {
+                // Telegram exposes every DC as `kws{dc}.<domain>`. Measure the
+                // two busiest DCs and keep the best RTT as the domain score.
+                let mut best: Option<u128> = None;
+                for dc in [2u8, 4u8] {
+                    let host = format!("kws{}.{}", dc, d);
+                    let start = std::time::Instant::now();
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(6),
+                        crate::raw_websocket::RawWebSocket::connect(&host, &host, "/apiws", true),
+                    )
+                    .await;
+                    if let Ok(Ok(mut ws)) = res {
+                        let _ = ws.close().await;
+                        let rtt = start.elapsed().as_micros();
+                        best = Some(best.map_or(rtt, |b| b.min(rtt)));
+                    }
+                }
+                (d, best)
+            }));
+        }
+
+        let mut results = HashMap::new();
+        for h in handles {
+            if let Ok((d, rtt)) = h.await {
+                results.insert(d, rtt);
+            }
+        }
+        if results.is_empty() {
+            return;
+        }
+        let mut health = self.health.write().await;
+        // Drop domains that vanished from the list, then merge this round.
+        health.retain(|d, _| results.contains_key(d));
+        for (d, rtt) in results {
+            health.insert(d, rtt);
+        }
+    }
+
+    /// Background loop: hourly GitHub domain refresh + health probes every
+    /// 5 minutes (first probe runs shortly after startup).
     pub fn start_background_refresh(self: Arc<Self>) {
+        // Health probe loop.
+        let probe = self.clone();
+        tokio::spawn(async move {
+            // Small settle delay so startup is not delayed by probes.
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            loop {
+                probe.probe_all().await;
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        });
+        // GitHub refresh loop.
         tokio::spawn(async move {
             loop {
                 if let Ok(domains) = fetch_github_cf_domains().await
@@ -214,4 +314,33 @@ pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn s
     }
 
     Err("Failed to parse GitHub release response".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Healthy domains (fastest first) → unknown → failed.
+    #[tokio::test]
+    async fn health_ordering_puts_failures_last() {
+        let b = Balancer::new();
+        b.update_domains_list(vec![
+            "a.test".to_string(),
+            "b.test".to_string(),
+            "c.test".to_string(),
+            "d.test".to_string(),
+        ])
+        .await;
+
+        b.record_success("b.test", 1_000).await;
+        b.record_success("a.test", 50_000).await;
+        b.record_failure("c.test").await;
+
+        // DC 9 is not in the sticky map, so the ordering is pure health.
+        let order = b.get_domains_for_dc(9).await;
+        assert_eq!(order[0], "b.test", "fastest healthy domain first");
+        assert_eq!(order[1], "a.test", "slower healthy domain second");
+        assert_eq!(order[2], "d.test", "unknown domain before the dead one");
+        assert_eq!(order[3], "c.test", "failed domain last");
+    }
 }

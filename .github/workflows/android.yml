@@ -1,0 +1,72 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - '.github/workflows/android.yml'
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      # ubuntu-latest ships the Android SDK + NDK; Tauri only needs the paths.
+      - name: Point Tauri at the preinstalled NDK
+        run: |
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Build frontend
+        run: bun install && bun run build
+
+      # gen/android is committed, but regenerate if it is ever missing.
+      - name: Init Android project
+        run: |
+          if [ ! -d src-tauri/gen/android ]; then
+            bunx tauri android init --ci
+          fi
+
+      # Release (no --debug): Gradle signs it with the debug keystore only for
+      # local testing; CI artefacts are unsigned release builds.
+      - name: Build release APK (arm64)
+        run: bunx tauri android build --apk --target aarch64 --ci
+
+      - name: Build release AAB (Play Store)
+        run: bunx tauri android build --aab --target aarch64 --ci
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-android
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+          if-no-files-found: error

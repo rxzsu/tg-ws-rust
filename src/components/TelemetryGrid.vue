@@ -51,6 +51,9 @@ defineProps<{
       </div>
       <div class="text-[9.5px] text-ink-3">
         Всего: {{ telemetry.connections_total }}
+        <span v-if="telemetry.connections_bad > 0" class="text-rose-300/80">
+          · сбоев: {{ telemetry.connections_bad }}
+        </span>
       </div>
     </div>
 
@@ -64,7 +67,9 @@ defineProps<{
         WS + H2
       </div>
       <div class="truncate text-[9.5px] text-ink-3">
-        {{ telemetry.connections_quic > 0 ? `QUIC: ${telemetry.connections_quic}` : 'Cloudflare CDN' }}
+        <template v-if="telemetry.connections_h3 > 0">H3: {{ telemetry.connections_h3 }}</template>
+        <template v-else-if="telemetry.connections_quic > 0">QUIC: {{ telemetry.connections_quic }}</template>
+        <template v-else>Cloudflare CDN</template>
       </div>
     </div>
   </div>

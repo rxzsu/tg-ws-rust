@@ -52,3 +52,43 @@ jobs:
 
       - name: Frontend build
         run: bun install && bun run build
+
+  # Compile-only gate for the mobile target: catches desktop-only APIs used
+  # without `cfg(desktop)`, which is exactly how the first Android build broke.
+  android-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust with the Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android-check
+
+      - name: Configure NDK toolchain
+        run: |
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+          echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+
+      # `tauri::generate_context!` needs the built frontend on disk.
+      - name: Frontend build
+        run: bun install && bun run build
+
+      - name: Cargo check (Android)
+        run: cargo check -p tg-ws-proxy-gui --target aarch64-linux-android
+        working-directory: src-tauri

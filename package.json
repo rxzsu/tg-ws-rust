@@ -1,7 +1,7 @@
 {
   "name": "tg-ws-proxy-gui",
   "private": true,
-  "version": "0.4.0",
+  "version": "1.0.0",
   "author": "nsvl",
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
   "dependencies": {
     "@paper-design/shaders": "^0.0.81",
     "@tauri-apps/plugin-autostart": "~2",
+    "@tauri-apps/plugin-opener": "~2",
     "lucide-vue-next": "^1.0.0",
     "qrcode": "^1.5.4",
     "vue": "^3.5.44"

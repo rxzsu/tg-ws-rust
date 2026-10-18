@@ -3,7 +3,8 @@
 //! setup cost. Run with `cargo bench -p tg-ws-proxy-core`.
 
 use aes::cipher::StreamCipher;
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::hint::black_box;
 use tg_ws_proxy_core::config::{PROTO_ABRIDGED_INT, PROTO_TAG_ABRIDGED};
 use tg_ws_proxy_core::crypto::CryptoCtx;
 use tg_ws_proxy_core::handshake::generate_relay_init;

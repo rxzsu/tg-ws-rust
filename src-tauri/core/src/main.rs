@@ -15,9 +15,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let config = ProxyConfig::default();
-    
-    // Command-line or env overrides can be applied here
+    let mut config = ProxyConfig::default();
+
+    // Optional overrides for local runs (the GUI passes config directly).
+    if let Ok(host) = std::env::var("TG_WS_HOST") {
+        config.host = host;
+    }
+    if let Ok(port) = std::env::var("TG_WS_PORT") {
+        config.port = port.parse().unwrap_or(config.port);
+    }
+    if let Ok(secret) = std::env::var("TG_WS_SECRET") {
+        config.secret = secret;
+    }
+    if let Ok(pool) = std::env::var("TG_WS_POOL") {
+        config.pool_size = pool.parse().unwrap_or(config.pool_size);
+    }
+
     println!("Starting tg-ws-proxy-core on {}:{}", config.host, config.port);
     println!("Secret: {}", config.secret);
 

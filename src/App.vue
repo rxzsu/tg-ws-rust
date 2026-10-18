@@ -21,6 +21,7 @@ const sidebarCollapsed = ref(false)
 
 const {
   isRunning,
+  isMobile,
   updateInfo,
   isTestingConnectivity,
   testResults,
@@ -64,10 +65,10 @@ async function openRelease() {
 </script>
 
 <template>
-  <div class="flex h-screen flex-col overflow-hidden">
-    <TitleBar />
+  <div class="app-shell flex h-screen flex-col overflow-hidden" :class="{ 'is-mobile': isMobile }">
+    <TitleBar v-if="!isMobile" />
 
-    <div class="flex min-h-0 flex-1 gap-3 px-3 pb-3">
+    <div class="flex min-h-0 flex-1 gap-3 px-3 pb-3" :class="{ 'px-2 pb-2': isMobile }">
       <SideNav
         v-model:active="activeTab"
         v-model:collapsed="sidebarCollapsed"
@@ -144,6 +145,12 @@ async function openRelease() {
 </template>
 
 <style scoped>
+/* Keep content clear of the notch / gesture bar on Android & iOS. */
+.app-shell.is-mobile {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.16s ease;

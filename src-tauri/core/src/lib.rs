@@ -1,9 +1,10 @@
 pub mod balancer;
 pub mod bridge;
-pub mod cf_h2;
+pub mod bufpool;
 pub mod config;
 pub mod crypto;
 pub mod fake_tls;
+pub mod h3;
 pub mod handshake;
 pub mod logging;
 pub mod net;
@@ -61,6 +62,17 @@ pub async fn run_server_with_stats(
     stats: Arc<Stats>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Err(msg) = crate::config::validate(&config) {
+        error!("{}", msg);
+        return Err(msg.into());
+    }
+
+    // The dependency tree contains both `ring` (quinn) and `aws-lc-rs`, so
+    // rustls cannot pick a provider on its own and panics on first use. The
+    // GUI binary installs one in `main`, but the core must be safe to embed
+    // anywhere — the balancer's background TLS probes hit this immediately.
+    crate::quic::ensure_crypto_provider();
+
     let addr = format!("{}:{}", config.host, config.port);
     let listener = match crate::net::bind_listener(&config.host, config.port).await {
         Ok(l) => l,
@@ -72,7 +84,11 @@ pub async fn run_server_with_stats(
     };
     info!("tg-ws-proxy listening on {}", addr);
 
-    let secret_bytes = hex::decode(&config.secret).unwrap_or_else(|_| vec![0u8; 16]);
+    // `validate` already proved this decodes to 16 bytes; a silent fallback to
+    // an all-zero key would look like a working proxy that never connects.
+    let secret_bytes = hex::decode(config.secret.trim())
+        .map_err(|_| "Секрет должен быть 32 hex-символа (16 байт)")?;
+    stats.mark_started();
     let secret = Arc::new(secret_bytes);
     let cfg = Arc::new(config);
     let pool = Arc::new(ConnectionPool::new(
@@ -81,12 +97,18 @@ pub async fn run_server_with_stats(
         cfg.pool_max_age_secs,
     ));
     pool.clone().start_cleanup_task();
+    pool.clone().start_keepalive_task();
     if cfg.pool_size > 0 {
         pool.warm_up_defaults(!cfg.disable_secure).await;
     }
 
     let balancer = Arc::new(Balancer::new());
     balancer.clone().start_background_refresh();
+
+    // Active sessions are tracked so a stop can drain them instead of
+    // dropping the handler futures mid-write (which used to cut the last
+    // packet and skip the WebSocket close frame).
+    let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
         let (stream, peer_addr) = tokio::select! {
@@ -101,7 +123,11 @@ pub async fn run_server_with_stats(
             }
             _ = shutdown_rx.recv() => {
                 info!("Server shutting down gracefully");
-                return Ok(());
+                break;
+            }
+            // Reap finished sessions so the set does not grow unbounded.
+            Some(_) = sessions.join_next() => {
+                continue;
             }
         };
 
@@ -122,24 +148,82 @@ pub async fn run_server_with_stats(
             }
         };
 
-        tokio::spawn(async move {
+        sessions.spawn(async move {
             stats.inc_total();
             stats.inc_active();
             let label = peer_addr.to_string();
 
+            let mut handler = Box::pin(handle_connection(
+                stream,
+                secret,
+                stats.clone(),
+                cfg,
+                pool,
+                balancer,
+                label.clone(),
+            ));
+
             tokio::select! {
-                res = handle_connection(stream, secret, stats.clone(), cfg, pool, balancer, label.clone()) => {
+                res = &mut handler => {
                     if let Err(e) = res {
                         warn!("[{}] connection error: {:?}", label, e);
+                        // Surfaced on the dashboard: without this the UI just
+                        // shows "running" while Telegram silently fails.
+                        stats.set_last_error(format!("{}: {}", label, e));
                     }
                 }
                 _ = conn_shutdown.recv() => {
+                    // Let in-flight writes flush and the close frame go out
+                    // instead of dropping the future on the spot.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(150),
+                        &mut handler,
+                    )
+                    .await;
                     info!("[{}] connection closed due to proxy stop", label);
                 }
             }
             stats.dec_active();
         });
     }
+
+    // Stop accepting, then give live sessions a short window to finish.
+    drop(listener);
+    let aborted = drain_sessions(&mut sessions, std::time::Duration::from_millis(1000)).await;
+    if aborted > 0 {
+        info!("Aborted {} session(s) that were still active after the grace period", aborted);
+    }
+    Ok(())
+}
+
+/// Wait for tracked sessions to finish, aborting whatever is still running
+/// after `grace`. Returns how many sessions had to be aborted.
+async fn drain_sessions(
+    sessions: &mut tokio::task::JoinSet<()>,
+    grace: std::time::Duration,
+) -> usize {
+    let mut alive = sessions.len();
+    let deadline = tokio::time::sleep(grace);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                sessions.shutdown().await;
+                break;
+            }
+            joined = sessions.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+                alive = alive.saturating_sub(1);
+                if alive == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    alive
 }
 
 pub async fn run_server(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -289,7 +373,23 @@ async fn handle_connection(
     let domains = crate::config::ws_domains(dc_id, hs.is_media);
     let mut ws: Option<RawWebSocket> = None;
 
+    // Telegram only fronts `/apiws` on DC2/DC4. Attempting DC1/3/5 anyway
+    // burns a full `connect_timeout` of dead air per retry (their IPs are
+    // DPI-blackholed) and leaves the client in a reconnect loop, so skip
+    // straight to the fallbacks and say so.
+    if !crate::config::has_ws_front(dc_id) {
+        const NO_FRONT: &str = "DC1/3/5 не имеют WS-фронта: /apiws отвечает 302, \
+             MTProto-TCP к их IP заблокирован провайдером";
+        stats.record_dc_route(dc_id, "no_front", NO_FRONT);
+        warn!(
+            "[{}] DC{} has no WebSocket front (telegram.org/apiws answers 302 there); \
+             going straight to fallbacks",
+            label, dc_id
+        );
+    }
+
     for domain in &domains {
+        let attempt_start = std::time::Instant::now();
         // Pool check
         if let Some(mut pooled) = pool.get(domain).await {
             // Auto-replenish pool in background so next client connection also gets 0ms latency
@@ -298,9 +398,13 @@ async fn handle_connection(
 
             if pooled.send(&relay_init).await.is_ok() {
                 stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
                 ws = Some(pooled);
                 break;
             }
+            // Pooled socket was dead on arrival: drop it and deprioritize the
+            // domain before the fresh-connect attempt below.
+            balancer.record_failure(domain).await;
         }
 
         info!("[{}] Connecting to upstream WS {}", label, domain);
@@ -316,53 +420,109 @@ async fn handle_connection(
             Ok(Ok(mut socket)) => {
                 if let Err(e) = socket.send(&relay_init).await {
                     warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
+                    // Dead endpoint: deprioritize and rotate before the next attempt.
+                    balancer.record_failure(domain).await;
                     continue;
                 }
+                stats.record_dc_route(dc_id, "ok", format!("WS {}", domain));
                 stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
                 ws = Some(socket);
                 break;
             }
             Ok(Err(e)) => {
                 warn!("[{}] Connection to {} failed: {:?}", label, domain, e);
+                balancer.record_failure(domain).await;
+                stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
             }
             Err(_) => {
                 warn!("[{}] Connection to {} timed out", label, domain);
+                balancer.record_failure(domain).await;
+                stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
             }
         }
     }
 
-    // 1b. QUIC relays (experimental): only when enabled AND relays are
-    // configured. Telegram DCs don't speak QUIC, so without user relays
-    // this step is skipped entirely (zero behavior change by default).
-    if ws.is_none() && cfg.transport != "ws" && !cfg.quic_relays.is_empty() {
+    if ws.is_none() {
+        // Every direct domain failed: move this DC's sticky pick to the next
+        // healthiest one so the next connection does not start on a dead node.
+        balancer.rotate_domain_for_dc(dc_id).await;
+    }
+
+    // 1b. Relay transports (experimental): only when relays are configured.
+    // Telegram DCs don't speak QUIC, so without user relays this step is
+    // skipped entirely (zero behavior change by default).
+    //   `quic` → custom ALPN, raw bidirectional stream
+    //   `h3`   → real HTTP/3, MTProto is the body of POST /mtproto
+    //   `auto` → try both, QUIC first
+    if ws.is_none() && !cfg.quic_relays.is_empty() {
+        use tokio::io::AsyncWriteExt;
         let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        for relay in &cfg.quic_relays {
-            info!("[{}] QUIC relay: {}", label, relay);
-            match crate::quic::connect_quic(relay, ct).await {
-                Ok(mut up) => {
-                    if up.send.write_all(&relay_init).await.is_ok() {
-                        stats
-                            .connections_quic
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        info!("[{}] QUIC relay {} connected", label, relay);
-                        return bridge_tcp_fallback(
-                            client_reader,
-                            client_writer,
-                            RemoteIo {
-                                reader: up.recv,
-                                writer: up.send,
-                            },
-                            ctx,
-                            stats,
-                            label,
-                            io_buf,
-                        )
-                        .await;
+        let want_quic = matches!(cfg.transport.as_str(), "auto" | "quic");
+        let want_h3 = matches!(cfg.transport.as_str(), "auto" | "h3");
+
+        if want_quic {
+            for relay in &cfg.quic_relays {
+                info!("[{}] QUIC relay: {}", label, relay);
+                match crate::quic::connect_quic(relay, ct).await {
+                    Ok(mut up) => {
+                        if up.send.write_all(&relay_init).await.is_ok() {
+                            stats
+                                .connections_quic
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            info!("[{}] QUIC relay {} connected", label, relay);
+                            return bridge_tcp_fallback(
+                                client_reader,
+                                client_writer,
+                                RemoteIo {
+                                    reader: up.recv,
+                                    writer: up.send,
+                                },
+                                ctx,
+                                stats,
+                                label,
+                                io_buf,
+                            )
+                            .await;
+                        }
+                        warn!("[{}] QUIC relay {} init failed", label, relay);
                     }
-                    warn!("[{}] QUIC relay {} init failed", label, relay);
+                    Err(e) => {
+                        warn!("[{}] QUIC relay {} failed: {:?}", label, relay, e);
+                    }
                 }
-                Err(e) => {
-                    warn!("[{}] QUIC relay {} failed: {:?}", label, relay, e);
+            }
+        }
+
+        if want_h3 {
+            for relay in &cfg.quic_relays {
+                info!("[{}] HTTP/3 relay: {}", label, relay);
+                match crate::h3::connect_h3(relay, ct).await {
+                    Ok(mut up) => {
+                        if up.writer.write_all(&relay_init).await.is_ok() {
+                            stats
+                                .connections_h3
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            info!("[{}] HTTP/3 relay {} connected", label, relay);
+                            return bridge_tcp_fallback(
+                                client_reader,
+                                client_writer,
+                                RemoteIo {
+                                    reader: up.reader,
+                                    writer: up.writer,
+                                },
+                                ctx,
+                                stats,
+                                label,
+                                io_buf,
+                            )
+                            .await;
+                        }
+                        warn!("[{}] HTTP/3 relay {} init failed", label, relay);
+                    }
+                    Err(e) => {
+                        warn!("[{}] HTTP/3 relay {} failed: {:?}", label, relay, e);
+                    }
                 }
             }
         }
@@ -435,14 +595,21 @@ async fn handle_connection(
         && let Some(target_ip) = get_default_dc_ip(dc_id, is_test)
     {
         info!("[{}] All WebSockets failed, engaging Direct TCP Fallback to {}:443", label, target_ip);
+        // A blackholed IP never answers, so waiting the full connect timeout
+        // here only adds dead air to a route that is already doomed. Probe
+        // briefly instead; the fallback chain has better options behind it.
+        let probe_timeout = std::time::Duration::from_secs(
+            cfg.connect_timeout_secs.clamp(1, 3),
+        );
         let tcp_conn = tokio::time::timeout(
-            std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120)),
+            probe_timeout,
             crate::net::tcp_connect(target_ip, 443, io_buf)
         ).await;
 
         if let Ok(Ok(mut remote_stream)) = tcp_conn {
             use tokio::io::AsyncWriteExt;
             if remote_stream.write_all(&relay_init).await.is_ok() && remote_stream.flush().await.is_ok() {
+                stats.record_dc_route(dc_id, "ok", format!("TCP {}:443", target_ip));
                 stats.connections_tcp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("[{}] Direct TCP Fallback connected to {}:443", label, target_ip);
                 let (remote_reader, remote_writer) = remote_stream.into_split();
@@ -450,13 +617,31 @@ async fn handle_connection(
             }
         } else {
             warn!("[{}] Direct TCP Fallback connection to {}:443 failed", label, target_ip);
+            stats.record_dc_route(
+                dc_id,
+                "failed",
+                format!("MTProto-TCP {}:443 заблокирован (нет ответа)", target_ip),
+            );
         }
     }
 
     let ws = match ws {
         Some(w) => w,
         None => {
-            return Err(format!("Could not connect to any upstream for DC{}", hs.dc_id).into());
+            let detail = if !crate::config::has_ws_front(dc_id) {
+                format!(
+                    "DC{} недоступен: WS-фронта /apiws у него нет, а MTProto-TCP к {} \
+                     блокируется провайдером. Файлы и медиа с этой DC не загрузятся — \
+                     добавьте релей (домен на Cloudflare, Worker или QUIC/H3) или другой канал связи",
+                    dc_id,
+                    get_default_dc_ip(dc_id, is_test).unwrap_or("DC-IP")
+                )
+            } else {
+                format!("все апстримы для DC{} (WS, CF, TCP) недоступны", dc_id)
+            };
+            stats.record_dc_route(dc_id, "failed", &detail);
+            stats.set_last_error(format!("DC{}: {}", dc_id, detail));
+            return Err(format!("Не удалось подключиться к DC{}: {}", hs.dc_id, detail).into());
         }
     };
 
@@ -477,4 +662,36 @@ async fn handle_connection(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::drain_sessions;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn drains_finished_sessions_within_grace() {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            set.spawn(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            });
+        }
+        let aborted = drain_sessions(&mut set, Duration::from_millis(500)).await;
+        assert_eq!(aborted, 0, "both sessions finished within the grace window");
+        assert!(set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborts_stuck_sessions_after_grace() {
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        let aborted = drain_sessions(&mut set, Duration::from_millis(50)).await;
+        assert_eq!(aborted, 1, "the stuck session must be aborted");
+        assert!(started.elapsed() < Duration::from_secs(2), "drain must not hang");
+        assert!(set.is_empty(), "stuck sessions must be aborted");
+    }
 }

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">"tg-ws-proxy"</string>
+    <string name="main_activity_title">"tg-ws-proxy"</string>
+</resources>

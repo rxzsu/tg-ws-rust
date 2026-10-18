@@ -1,12 +1,33 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Square, Power, RefreshCw } from 'lucide-vue-next'
 import TelemetryGrid from '../components/TelemetryGrid.vue'
 import SpeedChart from '../components/SpeedChart.vue'
 import TgLinkCard from '../components/TgLinkCard.vue'
 import GrainGradient from '../components/ui/GrainGradient.vue'
-import { useProxy } from '../composables/useProxy'
+import { useProxy, toggleProxy, restartProxy, clearLastError } from '../composables/useProxy'
 
-const { isRunning, config, telemetry, tgLink, speedHistoryUp, speedHistoryDown, toggleProxy, restartProxy } = useProxy()
+const { isRunning, config, telemetry, tgLink, speedHistoryUp, speedHistoryDown } = useProxy()
+
+async function copyError() {
+  try {
+    await navigator.clipboard.writeText(telemetry.value.last_error)
+  } catch {
+    /* clipboard blocked: nothing else to do */
+  }
+}
+
+/** Compact uptime: 42с → 7м 12с → 3ч 07м. */
+const uptimeLabel = computed(() => {
+  const total = telemetry.value.uptime_secs
+  if (!isRunning.value || total <= 0) return ''
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}ч ${String(m).padStart(2, '0')}м`
+  if (m > 0) return `${m}м ${String(s).padStart(2, '0')}с`
+  return `${s}с`
+})
 </script>
 
 <template>
@@ -48,7 +69,31 @@ const { isRunning, config, telemetry, tgLink, speedHistoryUp, speedHistoryDown, 
           <div class="flex flex-wrap items-center gap-1.5">
             <span class="chip mono">{{ config.host }}:{{ config.port }}</span>
             <span class="chip">MTProto · WSS</span>
+            <span v-if="uptimeLabel" class="chip mono emerald-border">● {{ uptimeLabel }}</span>
             <span v-if="config.fake_tls_domain" class="chip emerald-border">SNI: {{ config.fake_tls_domain }}</span>
+          </div>
+
+          <div
+            v-if="telemetry.last_error"
+            class="flex items-start gap-2 rounded-lg border border-rose-400/25 bg-rose-500/10 px-2.5 py-1.5"
+          >
+            <span class="min-w-0 flex-1 truncate font-mono text-[10px] leading-4 text-rose-200/90" :title="telemetry.last_error">
+              ⚠ {{ telemetry.last_error }}
+            </span>
+            <button
+              class="shrink-0 rounded px-1.5 text-[10px] text-rose-200/70 transition hover:bg-rose-400/15 hover:text-rose-100"
+              title="Скопировать текст ошибки для issue"
+              @click="copyError"
+            >
+              копировать
+            </button>
+            <button
+              class="shrink-0 rounded px-1.5 text-[10px] text-rose-200/70 transition hover:bg-rose-400/15 hover:text-rose-100"
+              title="Скрыть"
+              @click="clearLastError"
+            >
+              ✕
+            </button>
           </div>
 
           <div class="flex items-center gap-2">

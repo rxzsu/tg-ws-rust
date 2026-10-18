@@ -35,8 +35,9 @@ pub struct ProxyConfig {
     pub splitter_enabled: bool,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    /// Upstream transport: "auto" (WS, then QUIC relays if set, then
-    /// fallbacks), "ws" (WebSocket only), "quic" (QUIC relays first).
+    /// Upstream transport: "auto" (WS, then QUIC/h3 relays if set, then
+    /// fallbacks), "ws" (WebSocket only), "quic" (custom-ALPN QUIC relays
+    /// first), "h3" (HTTP/3 relays first).
     #[serde(default = "default_transport")]
     pub transport: String,
     /// User-run QUIC relays as `host:port` (experimental, v1.0 phase 3).
@@ -98,6 +99,72 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Reject configurations that would silently misbehave.
+///
+/// Everything here has burned a real user at least once: a mistyped secret
+/// used to fall back to an all-zero key (the proxy "worked" but nothing
+/// connected), a 0 port bound a random one, and relay typos were only
+/// discovered at connect time deep inside the fallback chain.
+pub fn validate(cfg: &ProxyConfig) -> Result<(), String> {
+    if cfg.host.trim().is_empty() {
+        return Err("Хост не может быть пустым".into());
+    }
+    if cfg.host.parse::<std::net::IpAddr>().is_err() && cfg.host != "localhost" {
+        return Err(format!(
+            "Хост «{}» — нужен IP-адрес (например 127.0.0.1) или localhost",
+            cfg.host
+        ));
+    }
+
+    if cfg.port == 0 {
+        return Err("Порт не может быть 0".into());
+    }
+
+    let secret = cfg.secret.trim();
+    if secret.len() != 32 || hex::decode(secret).is_err() {
+        return Err("Секрет должен быть 32 hex-символа (16 байт)".into());
+    }
+
+    if !(4096..=1024 * 1024).contains(&cfg.buffer_size) {
+        return Err(format!(
+            "Размер буфера {} вне диапазона 4 КБ – 1 МБ",
+            cfg.buffer_size
+        ));
+    }
+
+    if !(2..=120).contains(&cfg.connect_timeout_secs) {
+        return Err("Таймаут подключения должен быть от 2 до 120 секунд".into());
+    }
+
+    if cfg.pool_max_age_secs < 10 {
+        return Err("Время жизни пула должно быть не меньше 10 секунд".into());
+    }
+
+    for relay in &cfg.quic_relays {
+        let relay = relay.trim();
+        if relay.is_empty() {
+            continue;
+        }
+        match relay.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ => {
+                return Err(format!(
+                    "Релей «{}» — нужен формат host:port (например relay.example.com:443)",
+                    relay
+                ))
+            }
+        }
+    }
+
+    for (dc, ip) in &cfg.dc_redirects {
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!("DC{}: «{}» — не IP-адрес", dc, ip));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn get_default_dc_ip(dc: i32, is_test: bool) -> Option<&'static str> {
     if is_test {
         match dc {
@@ -118,8 +185,23 @@ pub fn get_default_dc_ip(dc: i32, is_test: bool) -> Option<&'static str> {
     }
 }
 
+/// DCs whose `/apiws` WebSocket front actually exists.
+///
+/// Measured against the shared front (149.154.167.220): DC2 and DC4 answer
+/// `101 Switching Protocols`, while DC1/DC3/DC5 answer `302 → core.telegram.org`
+/// — that front simply does not proxy `/apiws` for them, and their own
+/// per-DC IPs (149.154.17x.100) are DPI-blackholed on most regional networks.
+/// Trying them costs a full `connect_timeout` of dead air per attempt and
+/// leaves the client in a reconnect loop.
+pub fn has_ws_front(dc: i32) -> bool {
+    matches!(dc, 2 | 4)
+}
+
 pub fn ws_domains(dc: i32, is_media: bool) -> Vec<String> {
     let resolved_dc = if dc == 203 { 2 } else { dc };
+    if !has_ws_front(resolved_dc) {
+        return Vec::new();
+    }
     if !is_media {
         vec![format!("kws{}.web.telegram.org", resolved_dc)]
     } else {
@@ -181,6 +263,76 @@ mod tests {
         assert_eq!(cfg.transport, default_transport());
         assert!(cfg.quic_relays.is_empty());
         assert_eq!(cfg.port, 1443);
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        validate(&ProxyConfig::default()).expect("default config must pass validation");
+    }
+
+    #[test]
+    fn only_dc2_and_dc4_have_a_ws_front() {
+        assert!(has_ws_front(2));
+        assert!(has_ws_front(4));
+        for dc in [1, 3, 5, 10002] {
+            assert!(!has_ws_front(dc), "DC{} must have no WS front", dc);
+        }
+        assert_eq!(ws_domains(1, false), Vec::<String>::new());
+        assert_eq!(ws_domains(3, true), Vec::<String>::new());
+        assert_eq!(ws_domains(2, false), vec!["kws2.web.telegram.org"]);
+        assert_eq!(
+            ws_domains(4, true),
+            vec!["kws4-1.web.telegram.org", "kws4.web.telegram.org"]
+        );
+        // Test DCs collapse onto DC2 and therefore stay reachable.
+        assert_eq!(ws_domains(10002, false), vec!["kws2.web.telegram.org"]);
+    }
+
+    #[test]
+    fn rejects_bad_secret() {
+        let mut cfg = ProxyConfig {
+            secret: "not-hex".into(),
+            ..Default::default()
+        };
+        assert!(validate(&cfg).unwrap_err().contains("Секрет"));
+
+        // 32 chars but not hex.
+        cfg.secret = "zz".repeat(16);
+        assert!(validate(&cfg).is_err());
+
+        // Correct length, wrong case is still hex.
+        cfg.secret = "AABBCCDDEEFF00112233445566778899".into();
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_host_and_port() {
+        let mut cfg = ProxyConfig {
+            host: "127.0.0.1:1443".into(),
+            ..Default::default()
+        };
+        assert!(validate(&cfg).is_err());
+
+        cfg.host = "localhost".into();
+        assert!(validate(&cfg).is_ok());
+
+        cfg.port = 0;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_relay_and_dc_ip() {
+        let mut cfg = ProxyConfig {
+            quic_relays: vec!["relay.example.com".into()],
+            ..Default::default()
+        };
+        assert!(validate(&cfg).unwrap_err().contains("host:port"));
+
+        cfg.quic_relays = vec!["relay.example.com:443".into()];
+        assert!(validate(&cfg).is_ok());
+
+        cfg.dc_redirects.insert(2, "not-an-ip".into());
+        assert!(validate(&cfg).unwrap_err().contains("IP"));
     }
 }
 

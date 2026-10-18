@@ -24,3 +24,6 @@ dist-ssr
 # Rust
 target/
 src-tauri/target/
+
+# Agent working memory
+.workbuddy-ai/

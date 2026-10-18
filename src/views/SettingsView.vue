@@ -4,6 +4,7 @@ import { RefreshCw, Wifi, Zap, Scale, EyeOff, Cable, Globe, ShieldCheck, Cloud, 
 import SectionCard from '../components/ui/SectionCard.vue'
 import ToggleRow from '../components/ui/ToggleRow.vue'
 import NumberField from '../components/ui/NumberField.vue'
+import SelectField, { type SelectOption } from '../components/ui/SelectField.vue'
 import {
   useProxy,
   splitList,
@@ -13,23 +14,35 @@ import {
   type PresetId,
 } from '../composables/useProxy'
 import { invoke } from '@tauri-apps/api/core'
+// Actions live at module scope, not on the useProxy() return value.
+import { toggleAutostart, applyPreset, saveSettings, generateSecret, checkForUpdates, runConnectivityTest } from '../composables/useProxy'
 
 const {
   config,
   appVersion,
   autostartActive,
   activePreset,
+  isMobile,
   isCheckingUpdate,
   isTestingConnectivity,
-  toggleAutostart,
-  applyPreset,
-  saveSettings,
-  generateSecret,
-  checkForUpdates,
-  runConnectivityTest,
 } = useProxy()
 
 const showAdvanced = ref(false)
+
+const transportOptions: SelectOption[] = [
+  {
+    value: 'auto',
+    label: 'Авто (WS → QUIC/H3 → CF → TCP)',
+    desc: 'Пробуем цепочку сверху вниз, продолжаем до первого успеха',
+  },
+  { value: 'ws', label: 'Только WebSocket', desc: 'Классический путь через домены Telegram CDN' },
+  { value: 'quic', label: 'QUIC в первую очередь', desc: 'Кастомный ALPN, UDP-релеи из списка' },
+  { value: 'h3', label: 'HTTP/3 в первую очередь', desc: 'POST /mtproto по QUIC — любой h3-сервер' },
+]
+
+const transportHint = computed(
+  () => transportOptions.find((o) => o.value === config.value.transport)?.desc ?? '',
+)
 
 // List inputs as live computed <-> config bindings
 const userDomainsInput = computed({
@@ -149,23 +162,21 @@ function scrollToSection(id: string) {
     <SectionCard
       id="sec-transport"
       title="Транспорт"
-      subtitle="QUIC — экспериментально"
+      subtitle="QUIC и HTTP/3 — экспериментально"
       :icon="Globe"
     >
       <div>
         <label class="field-label">Режим апстрима</label>
-        <select v-model="config.transport" class="input">
-          <option value="auto">Авто (WS → QUIC → CF → TCP)</option>
-          <option value="ws">Только WebSocket</option>
-          <option value="quic">QUIC в первую очередь</option>
-        </select>
+        <SelectField v-model="config.transport" :options="transportOptions" />
+        <p class="mt-1 text-[10px] leading-relaxed text-ink-3">{{ transportHint }}</p>
       </div>
 
       <div v-if="config.transport !== 'ws'">
-        <label class="field-label">QUIC-релеи (host:port, через запятую)</label>
+        <label class="field-label">Релеи (host:port, через запятую)</label>
         <input v-model="quicRelaysInput" placeholder="relay.example.com:443" class="input mono" />
         <p class="mt-1 text-[10px] leading-relaxed text-ink-3">
-          Свои UDP-релеи с ALPN tg-ws-proxy-quic-v1. Без релеев поведение прежнее. Ошибка — тихий фолбэк дальше по цепочке.
+          Свои UDP-релеи. QUIC — ALPN <span class="font-mono">tg-ws-proxy-quic-v1</span>; HTTP/3 — обычный
+          <span class="font-mono">POST /mtproto</span> (подойдёт nginx, Caddy или Worker). Без релеев поведение прежнее.
         </p>
       </div>
     </SectionCard>
@@ -207,12 +218,6 @@ function scrollToSection(id: string) {
           v-model="config.fallback_cfproxy"
           title="Cloudflare Fallback"
           desc="Обход блокировок через сеть Cloudflare при сбоях прямого соединения"
-        />
-
-        <ToggleRow
-          v-model="config.cfproxy_h2_media"
-          title="HTTP/2 мультиплексирование"
-          desc="Ускорение загрузки медиа, картинок и видео в Telegram"
         />
 
         <div class="space-y-2.5">
@@ -307,7 +312,8 @@ function scrollToSection(id: string) {
       :icon="AppWindow"
     >
       <ToggleRow
-        v-model="autostartActive"
+        v-if="!isMobile"
+        :model-value="autostartActive"
         title="Автозапуск с системой"
         desc="Запускать мост в фоновом режиме при старте ОС"
         @update:model-value="toggleAutostart"

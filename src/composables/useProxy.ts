@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
@@ -41,12 +41,16 @@ export interface TelemetrySnapshot {
   connections_active: number
   connections_ws: number
   connections_quic: number
+  connections_h3: number
   connections_cfproxy: number
   connections_tcp: number
+  connections_bad: number
   bytes_up: number
   bytes_down: number
   speed_up_kbps: number
   speed_down_kbps: number
+  uptime_secs: number
+  last_error: string
 }
 
 export interface UpdateCheckResult {
@@ -121,15 +125,22 @@ const telemetry = ref<TelemetrySnapshot>({
   connections_active: 0,
   connections_ws: 0,
   connections_quic: 0,
+  connections_h3: 0,
   connections_cfproxy: 0,
   connections_tcp: 0,
+  connections_bad: 0,
   bytes_up: 0,
   bytes_down: 0,
   speed_up_kbps: 0,
   speed_down_kbps: 0,
+  uptime_secs: 0,
+  last_error: '',
 })
 const tgLink = ref('')
 const appVersion = ref('')
+const platform = ref('')
+/** True on Android/iOS: desktop chrome (window buttons, tray, autostart) is hidden. */
+const isMobile = computed(() => platform.value === 'android' || platform.value === 'ios')
 const autostartActive = ref(false)
 const updateInfo = ref<UpdateCheckResult | null>(null)
 const isCheckingUpdate = ref(false)
@@ -216,6 +227,11 @@ export async function initProxy(): Promise<boolean> {
     } catch {
       /* keep default */
     }
+    try {
+      platform.value = await invoke<string>('get_platform')
+    } catch {
+      platform.value = 'unknown'
+    }
   } catch (err) {
     console.error('Failed to load status:', err)
   }
@@ -288,8 +304,17 @@ export async function restartProxy() {
   }
 }
 
-export async function saveSettings() {
+/** Hide the "last error" banner without touching the running bridge. */
+export async function clearLastError() {
   try {
+    await invoke('clear_last_error')
+    telemetry.value.last_error = ''
+  } catch (err) {
+    console.error('Error clearing last error:', err)
+  }
+}
+
+export async function saveSettings() {  try {
     await invoke('save_config', { newConfig: config.value })
     await updateTgLink(config.value)
     isRunning.value = await invoke<boolean>('is_running')
@@ -303,17 +328,22 @@ export async function saveSettings() {
   }
 }
 
-export async function toggleAutostart() {
+export async function toggleAutostart(next: boolean) {
   try {
-    if (autostartActive.value) {
-      await disable()
-      autostartActive.value = false
-    } else {
+    if (next) {
       await enable()
-      autostartActive.value = true
+    } else {
+      await disable()
     }
+    autostartActive.value = next
   } catch (err) {
     console.error('Error toggling autostart:', err)
+    // Roll the switch back to the real state instead of lying to the user.
+    try {
+      autostartActive.value = await isEnabled()
+    } catch {
+      /* keep previous value */
+    }
     pushToast('Не удалось переключить автозапуск', 'error')
   }
 }
@@ -365,6 +395,8 @@ export function useProxy() {
     telemetry,
     tgLink,
     appVersion,
+    platform,
+    isMobile,
     autostartActive,
     updateInfo,
     isCheckingUpdate,
@@ -374,5 +406,17 @@ export function useProxy() {
     isTestingConnectivity,
     testResults,
     showTestModal,
+    // Actions are also exposed here: they used to be module-only, and views
+    // kept destructuring them from the composable, which silently produced
+    // `undefined` click handlers.
+    toggleProxy,
+    restartProxy,
+    saveSettings,
+    toggleAutostart,
+    applyPreset,
+    clearLastError,
+    generateSecret,
+    checkForUpdates,
+    runConnectivityTest,
   }
 }

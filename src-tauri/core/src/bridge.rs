@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use aes::cipher::StreamCipher;
+use crate::bufpool::acquire_buf;
 use crate::crypto::CryptoCtx;
 use crate::fake_tls::{ClientReader, ClientWriter};
 use crate::raw_websocket::RawWebSocket;
@@ -47,9 +48,9 @@ pub async fn bridge_ws_reencrypt(
 
     // Direct Upload Pipeline: Client -> Decrypt & Re-encrypt -> WS
     let upload_task = async move {
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = acquire_buf(buf_size);
         loop {
-            let n = match client_reader.read(&mut buf).await {
+            let n = match client_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
@@ -90,22 +91,25 @@ pub async fn bridge_ws_reencrypt(
 
     // Direct Download Pipeline: WS -> Decrypt & Re-encrypt -> Client
     let download_task = async move {
+        // One pooled buffer for the whole session: `recv_into` reuses its
+        // allocation instead of allocating a fresh Vec per WS frame.
+        let mut msg = acquire_buf(buf_size);
         loop {
-            match ws_reader.recv().await {
-                Ok(Some(mut msg)) => {
+            match ws_reader.recv_into(&mut msg).await {
+                Ok(true) => {
                     let n = msg.len();
                     stats_down.add_down(n);
 
                     // In-place decryption and re-encryption
-                    tg_dec.apply_keystream(&mut msg);
-                    clt_enc.apply_keystream(&mut msg);
+                    tg_dec.apply_keystream(&mut msg[..]);
+                    clt_enc.apply_keystream(&mut msg[..]);
 
-                    if let Err(e) = client_writer.write_all(&msg).await {
+                    if let Err(e) = client_writer.write_all(&msg[..]).await {
                         debug!("[{}] client write error: {:?}", label_down, e);
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(false) => break,
                 Err(e) => {
                     debug!("[{}] ws read error: {:?}", label_down, e);
                     break;
@@ -153,9 +157,9 @@ where
 
     // Client -> Decrypt (clt_dec) -> Encrypt (tg_enc) -> Remote TCP
     let upload_task = async move {
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = acquire_buf(buf_size);
         loop {
-            let n = match client_reader.read(&mut buf).await {
+            let n = match client_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
@@ -177,9 +181,9 @@ where
     // Remote TCP -> Decrypt (tg_dec) -> Encrypt (clt_enc) -> Client
     let download_task = async move {
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = acquire_buf(buf_size);
         loop {
-            let n = match remote_reader.read(&mut buf).await {
+            let n = match remote_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {

@@ -76,6 +76,67 @@ impl ConnectionPool {
         });
     }
 
+    /// Background keep-alive: every 15s send a real WS ping through each
+    /// pooled connection. Prevents Cloudflare/ISP idle timeouts from silently
+    /// killing hot sockets (~100s idle window on some networks).
+    ///
+    /// Sockets are moved out of the queue before awaiting, so the std `Mutex`
+    /// is never held across a `.await`; pings run concurrently and dead
+    /// sockets are simply not put back (the next `get` reconnects).
+    pub fn start_keepalive_task(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let queues: Vec<(String, DomainQueue)> = {
+                    let map = match self.domains.read() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                };
+                for (domain, q) in queues {
+                    let batch: Vec<(RawWebSocket, Instant)> = match q.lock() {
+                        Ok(mut l) => std::mem::take(&mut *l),
+                        Err(_) => continue,
+                    };
+                    if batch.is_empty() {
+                        continue;
+                    }
+
+                    let mut set = tokio::task::JoinSet::new();
+                    for (mut ws, created) in batch {
+                        set.spawn(async move {
+                            let alive =
+                                matches!(tokio::time::timeout(Duration::from_secs(5), ws.ping()).await, Ok(Ok(())));
+                            (ws, created, alive)
+                        });
+                    }
+
+                    let mut alive = Vec::new();
+                    let mut dropped = 0usize;
+                    while let Some(res) = set.join_next().await {
+                        match res {
+                            Ok((ws, created, true)) => alive.push((ws, created)),
+                            Ok(_) => dropped += 1,
+                            Err(e) => {
+                                dropped += 1;
+                                debug!("Pool keep-alive task panicked: {:?}", e);
+                            }
+                        }
+                    }
+                    if dropped > 0 {
+                        debug!("Pool keep-alive: dropped {} dead sockets for {}", dropped, domain);
+                    }
+                    if let Ok(mut l) = q.lock() {
+                        l.extend(alive);
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn get(&self, domain: &str) -> Option<RawWebSocket> {
         let q = self.queue_for(domain);
         let mut list = q.lock().ok()?;
