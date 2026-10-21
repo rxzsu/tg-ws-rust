@@ -14,6 +14,13 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Release signing is optional: the release workflow injects these env vars
+// from GitHub secrets. Without them Gradle produces an unsigned APK (useful
+// for local/testing builds, not installable as an update over a signed one).
+val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+val hasReleaseKeystore =
+    !releaseKeystorePath.isNullOrBlank() && file(releaseKeystorePath!!).exists()
+
 android {
     compileSdk = 36
     namespace = "com.rxzsu.tg_ws_proxy"
@@ -24,6 +31,16 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -40,6 +57,9 @@ android {
             }
         }
         getByName("release") {
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             optimization {
                enable = true
             }

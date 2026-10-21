@@ -4,6 +4,7 @@ import { Square, Power, RefreshCw } from 'lucide-vue-next'
 import TelemetryGrid from '../components/TelemetryGrid.vue'
 import SpeedChart from '../components/SpeedChart.vue'
 import TgLinkCard from '../components/TgLinkCard.vue'
+import DcRouteStrip from '../components/DcRouteStrip.vue'
 import GrainGradient from '../components/ui/GrainGradient.vue'
 import { useProxy, toggleProxy, restartProxy, clearLastError } from '../composables/useProxy'
 
@@ -121,6 +122,7 @@ const uptimeLabel = computed(() => {
 
     <!-- RIGHT: info (metrics + chart + link) -->
     <div class="flex flex-col gap-3">
+      <DcRouteStrip :routes="telemetry.dc_routes ?? []" />
       <TelemetryGrid :telemetry="telemetry" />
       <SpeedChart :up="speedHistoryUp" :down="speedHistoryDown" />
       <TgLinkCard :link="tgLink" class="flex-1" />

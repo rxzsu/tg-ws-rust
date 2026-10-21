@@ -104,8 +104,8 @@ const guides = computed<Guide[]>(() => [
   },
 ])
 
-const issuesUrl = 'https://github.com/Mr-llin/tg-ws-proxy-gui/issues'
-const repoUrl = 'https://github.com/Mr-llin/tg-ws-proxy-gui'
+const issuesUrl = 'https://github.com/rxzsu/tg-ws-rust/issues'
+const repoUrl = 'https://github.com/rxzsu/tg-ws-rust'
 
 async function openIssues() {
   await invoke('open_url', { url: issuesUrl })

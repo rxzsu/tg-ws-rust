@@ -69,7 +69,13 @@ impl Stats {
     }
 
     pub fn dec_active(&self) {
-        self.connections_active.fetch_sub(1, Ordering::Relaxed);
+        // Saturating: a stop (or a bug elsewhere) must never wrap this to
+        // u64::MAX and make the dashboard show 18 quintillion connections.
+        let _ = self
+            .connections_active
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     pub fn add_up(&self, n: usize) {
@@ -199,5 +205,15 @@ mod tests {
         let routes = stats.snapshot(0.0, 0.0).dc_routes;
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].state, "timeout");
+    }
+
+    #[test]
+    fn dec_active_never_underflows() {
+        let stats = Stats::new();
+        stats.dec_active();
+        assert_eq!(stats.connections_active.load(Ordering::Relaxed), 0);
+        stats.inc_active();
+        stats.dec_active();
+        assert_eq!(stats.connections_active.load(Ordering::Relaxed), 0);
     }
 }

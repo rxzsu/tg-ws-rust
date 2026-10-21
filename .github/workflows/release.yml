@@ -145,7 +145,26 @@ jobs:
             bunx tauri android init --ci
           fi
 
+      # Optional release signing: add the four repository secrets to produce a
+      # signed APK. Without them the build still succeeds but the artifact is
+      # unsigned and cannot be installed as an update over a signed build.
+      - name: Decode release keystore (optional)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "No ANDROID_KEYSTORE_BASE64 secret: building an unsigned APK"
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+
       - name: Build release APK (arm64 + universal)
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: bunx tauri android build --apk --target aarch64 --ci
 
       - name: Upload APK to the release

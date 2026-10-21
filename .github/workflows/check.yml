@@ -34,20 +34,19 @@ jobs:
           packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
           version: 1.0
 
-      # NOTE: benches are excluded on purpose. On CI `core` is a plain
-      # path-dependency (not a workspace member), so cargo ignores its
-      # dev-dependencies and `criterion` is unresolvable there.
-      # Benches are verified locally via `cargo bench`.
+      # `core` is a workspace member, so its dev-dependencies resolve.
+      # Benches stay out of the gate (long-running); verify locally with
+      # `cargo bench -p tg-ws-proxy-core`.
       - name: Clippy (core, deny warnings)
-        run: cargo clippy -p tg-ws-proxy-core --lib --tests -- -D warnings
+        run: cargo clippy -p tg-ws-proxy-core --lib --tests --locked -- -D warnings
         working-directory: src-tauri
 
       - name: Clippy (gui, deny warnings)
-        run: cargo clippy -p tg-ws-proxy-gui --lib -- -D warnings
+        run: cargo clippy -p tg-ws-proxy-gui --lib --locked -- -D warnings
         working-directory: src-tauri
 
       - name: Tests (core)
-        run: cargo test -p tg-ws-proxy-core
+        run: cargo test -p tg-ws-proxy-core --locked
         working-directory: src-tauri
 
       - name: Frontend build
@@ -90,5 +89,5 @@ jobs:
         run: bun install && bun run build
 
       - name: Cargo check (Android)
-        run: cargo check -p tg-ws-proxy-gui --target aarch64-linux-android
+        run: cargo check -p tg-ws-proxy-gui --locked --target aarch64-linux-android
         working-directory: src-tauri

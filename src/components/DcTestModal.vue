@@ -27,7 +27,7 @@ const emit = defineEmits<{
 
     <div v-if="testing" class="flex flex-col items-center justify-center gap-3 py-8">
       <RefreshCw class="h-6 w-6 animate-spin text-emerald-400" />
-      <span class="text-xs text-ink-2">Отправка тестовых WebSocket-пакетов к DC1–DC5…</span>
+      <span class="text-xs text-ink-2">Проверка WS-фронтов DC2/DC4 и пользовательских доменов…</span>
     </div>
 
     <div v-else class="max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -41,7 +41,9 @@ const emit = defineEmits<{
             class="h-2.5 w-2.5 rounded-full"
             :class="item.ok
               ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]'
-              : 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.9)]'"
+              : item.no_front
+                ? 'bg-ink-3'
+                : 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.9)]'"
           />
           <div>
             <div class="text-xs font-bold text-white">{{ item.dc }}</div>
@@ -53,7 +55,9 @@ const emit = defineEmits<{
           class="rounded-lg px-2 py-0.5 font-mono text-[10px] font-semibold"
           :class="item.ok
             ? 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
-            : 'border border-rose-500/20 bg-rose-500/10 text-rose-400'"
+            : item.no_front
+              ? 'border border-white/10 bg-white/[0.04] text-ink-3'
+              : 'border border-rose-500/20 bg-rose-500/10 text-rose-400'"
         >
           {{ item.message }}
         </span>

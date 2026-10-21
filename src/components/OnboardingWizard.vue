@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { X, ChevronLeft, ChevronRight, Rocket, KeyRound, Dices, ExternalLink } from 'lucide-vue-next'
 import BaseModal from './ui/BaseModal.vue'
 import TgLinkCard from './TgLinkCard.vue'
 import { useProxy, saveSettings } from '../composables/useProxy'
+import { formatInvokeError } from '../utils/format'
 
 const props = defineProps<{
   show: boolean
@@ -14,30 +15,80 @@ const emit = defineEmits<{
   close: []
 }>()
 
-const { tgLink } = useProxy()
+const { tgLink, config, isRunning } = useProxy()
 
 const step = ref(1)
-const port = ref(1443)
+const port = ref(config.value.port)
 const portError = ref('')
+const saveError = ref('')
+const saving = ref(false)
+
+// Re-sync with the saved config every time the wizard opens: a hardcoded
+// 1443 used to overwrite a port the user had already configured.
+watch(
+  () => props.show,
+  (show) => {
+    if (!show) return
+    port.value = config.value.port
+    portError.value = ''
+    saveError.value = ''
+  },
+)
 
 async function generateSecret() {
   const arr = new Uint8Array(16)
   window.crypto.getRandomValues(arr)
   const secret = Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
-  ;(useProxy().config.value).secret = secret
-  await saveSettings()
+  config.value.secret = secret
+  saveError.value = ''
+  if (!(await saveSettings())) {
+    saveError.value = 'Не удалось сохранить секрет. Проверьте права на config.json.'
+  }
 }
 
 async function goStep3() {
+  if (saving.value) return
   const p = Number(port.value)
   if (!Number.isInteger(p) || p < 1 || p > 65535) {
     portError.value = 'Порт должен быть числом от 1 до 65535'
     return
   }
   portError.value = ''
-  ;(useProxy().config.value).port = p
-  await saveSettings()
-  step.value = 3
+  saveError.value = ''
+  saving.value = true
+  try {
+    // Don't let the user walk into a "port busy" error on the last screen.
+    if (!isRunning.value) {
+      try {
+        await invoke('check_port', { host: config.value.host, port: p })
+      } catch (e) {
+        portError.value = formatInvokeError(e)
+        return
+      }
+    }
+
+    config.value.port = p
+    if (!(await saveSettings())) {
+      saveError.value = 'Настройки не сохранены — мост не запущен.'
+      return
+    }
+
+    // Saving no longer starts a stopped bridge (that surprised users), but
+    // onboarding explicitly ends with a running proxy.
+    if (!isRunning.value) {
+      try {
+        await invoke<string>('start_proxy')
+        isRunning.value = true
+      } catch (e) {
+        saveError.value = `Не удалось запустить мост: ${formatInvokeError(e)}`
+        return
+      }
+    }
+
+    step.value = 3
+  } finally {
+    saving.value = false
+  }
 }
 
 async function openTelegram() {
@@ -105,24 +156,28 @@ async function openTelegram() {
           class="input mono"
         />
         <p v-if="portError" class="mt-1.5 text-[11px] text-err">{{ portError }}</p>
-        <p class="mt-1 text-[10px] text-ink-3">Оставьте 1443, если порт не занят другим приложением</p>
+        <p v-else class="mt-1 text-[10px] text-ink-3">Порт должен быть свободен и не занят другим приложением</p>
       </div>
 
       <div>
         <label class="field-label">Секрет MTProto</label>
         <div class="flex gap-2">
           <input
-            :value="(useProxy().config.value).secret"
+            :value="config.secret"
             readonly
             class="input mono flex-1"
           />
-          <button class="btn btn-ghost" @click="generateSecret">
+          <button class="btn btn-ghost" :disabled="saving" @click="generateSecret">
             <Dices class="h-3.5 w-3.5" />
             <span>Новый</span>
           </button>
         </div>
         <p class="mt-1 text-[10px] text-ink-3">Случайные 32 hex-символа — ваш ключ шифрования</p>
       </div>
+
+      <p v-if="saveError" class="rounded-lg border border-rose-400/25 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-200/90">
+        {{ saveError }}
+      </p>
     </div>
 
     <!-- Step 3: Link -->
@@ -161,9 +216,10 @@ async function openTelegram() {
         <button
           v-else-if="step === 2"
           class="btn btn-primary"
+          :disabled="saving"
           @click="goStep3"
         >
-          Сохранить и открыть Telegram
+          {{ saving ? 'Сохранение…' : 'Сохранить и открыть Telegram' }}
           <ChevronRight class="h-3.5 w-3.5" />
         </button>
         <button

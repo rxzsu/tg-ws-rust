@@ -53,7 +53,7 @@ const items: Array<{ id: TabId; label: string; icon: typeof LayoutDashboard }> =
     <button
       class="rail-btn"
       :disabled="isTestingConnectivity"
-      title="Тест связи DC1–DC5"
+      title="Тест WS-фронтов DC2/DC4"
       @click="emit('dc-test')"
     >
       <Wifi class="h-4 w-4 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
@@ -108,7 +108,7 @@ const items: Array<{ id: TabId; label: string; icon: typeof LayoutDashboard }> =
       <button
         class="nav-item mt-3"
         :disabled="isTestingConnectivity"
-        title="Проверить пинг и доступность DC1–DC5"
+        title="Проверить WS-фронты DC2/DC4 и пользовательские домены"
         @click="emit('dc-test')"
       >
         <Wifi class="h-4 w-4 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />

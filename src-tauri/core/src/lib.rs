@@ -13,6 +13,7 @@ pub mod quic;
 pub mod raw_websocket;
 pub mod splitter;
 pub mod stats;
+pub mod version;
 
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -92,9 +93,10 @@ pub async fn run_server_with_stats(
     let secret = Arc::new(secret_bytes);
     let cfg = Arc::new(config);
     let pool = Arc::new(ConnectionPool::new(
-        cfg.pool_size.max(1),
+        cfg.pool_size,
         crate::net::clamp_io_buf(cfg.buffer_size),
         cfg.pool_max_age_secs,
+        cfg.pool_keepalive_secs,
     ));
     pool.clone().start_cleanup_task();
     pool.clone().start_keepalive_task();
@@ -102,7 +104,7 @@ pub async fn run_server_with_stats(
         pool.warm_up_defaults(!cfg.disable_secure).await;
     }
 
-    let balancer = Arc::new(Balancer::new());
+    let balancer = Arc::new(Balancer::with_builtins(cfg.use_builtin_cf_domains));
     balancer.clone().start_background_refresh();
 
     // Active sessions are tracked so a stop can drain them instead of
@@ -377,7 +379,7 @@ async fn handle_connection(
     // burns a full `connect_timeout` of dead air per retry (their IPs are
     // DPI-blackholed) and leaves the client in a reconnect loop, so skip
     // straight to the fallbacks and say so.
-    if !crate::config::has_ws_front(dc_id) {
+    if domains.is_empty() {
         const NO_FRONT: &str = "DC1/3/5 не имеют WS-фронта: /apiws отвечает 302, \
              MTProto-TCP к их IP заблокирован провайдером";
         stats.record_dc_route(dc_id, "no_front", NO_FRONT);
@@ -410,10 +412,7 @@ async fn handle_connection(
         info!("[{}] Connecting to upstream WS {}", label, domain);
         let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
         let conn_res = tokio::time::timeout(ct, async {
-            match RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await {
-                Ok(s) => Ok(s),
-                Err(_) => RawWebSocket::connect_with_sni(domain, domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
-            }
+            RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await
         }).await;
 
         match conn_res {
@@ -552,10 +551,7 @@ async fn handle_connection(
         if ws.is_none() {
             for cf_domain in &cfg.cfproxy_user_domains {
                 info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
-                let conn = match RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf).await {
-                    Ok(s) => Ok(s),
-                    Err(_) => RawWebSocket::connect_with_sni(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
-                };
+                let conn = RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf).await;
                 if let Ok(mut cf_ws) = conn
                     && cf_ws.send(&relay_init).await.is_ok()
                 {
@@ -572,10 +568,7 @@ async fn handle_connection(
             for b_domain in balancer_domains {
                 let host = format!("kws{}.{}", dc_id, b_domain);
                 info!("[{}] Fallback Balancer Domain: {}", label, host);
-                let conn = match RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf).await {
-                    Ok(s) => Ok(s),
-                    Err(_) => RawWebSocket::connect_with_sni(&host, &host, "/apiws", !cfg.disable_secure, Some("sprinthost.ru"), io_buf).await,
-                };
+                let conn = RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf).await;
 
                 if let Ok(mut b_ws) = conn {
                     if b_ws.send(&relay_init).await.is_ok() {

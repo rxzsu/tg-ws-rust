@@ -31,10 +31,20 @@ pub struct ProxyConfig {
     pub log_max_mb: u32,
     #[serde(default = "default_pool_max_age_secs")]
     pub pool_max_age_secs: u64,
+    /// Keep-alive ping interval for pooled sockets in seconds.
+    /// `0` disables pings entirely (some relays do not answer WS pings).
+    #[serde(default = "default_pool_keepalive_secs")]
+    pub pool_keepalive_secs: u64,
     #[serde(default = "default_true")]
     pub splitter_enabled: bool,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Use the built-in third-party Cloudflare domain pool (and its hourly
+    /// GitHub refresh). Traffic through it leaves the user's control, so it
+    /// can be turned off; with no user domains/workers the fallback chain
+    /// then goes straight to direct TCP.
+    #[serde(default = "default_true")]
+    pub use_builtin_cf_domains: bool,
     /// Upstream transport: "auto" (WS, then QUIC/h3 relays if set, then
     /// fallbacks), "ws" (WebSocket only), "quic" (custom-ALPN QUIC relays
     /// first), "h3" (HTTP/3 relays first).
@@ -47,6 +57,10 @@ pub struct ProxyConfig {
 
 fn default_pool_max_age_secs() -> u64 {
     120
+}
+
+fn default_pool_keepalive_secs() -> u64 {
+    15
 }
 
 fn default_true() -> bool {
@@ -91,8 +105,10 @@ impl Default for ProxyConfig {
             verbose: false,
             log_max_mb: 20,
             pool_max_age_secs: default_pool_max_age_secs(),
+            pool_keepalive_secs: default_pool_keepalive_secs(),
             splitter_enabled: default_true(),
             connect_timeout_secs: default_connect_timeout_secs(),
+            use_builtin_cf_domains: true,
             transport: default_transport(),
             quic_relays: Vec::new(),
         }
@@ -138,6 +154,10 @@ pub fn validate(cfg: &ProxyConfig) -> Result<(), String> {
 
     if cfg.pool_max_age_secs < 10 {
         return Err("Время жизни пула должно быть не меньше 10 секунд".into());
+    }
+
+    if cfg.pool_keepalive_secs > 3600 {
+        return Err("Интервал keep-alive пула должен быть не больше 3600 секунд (0 — выключено)".into());
     }
 
     for relay in &cfg.quic_relays {
@@ -193,12 +213,22 @@ pub fn get_default_dc_ip(dc: i32, is_test: bool) -> Option<&'static str> {
 /// per-DC IPs (149.154.17x.100) are DPI-blackholed on most regional networks.
 /// Trying them costs a full `connect_timeout` of dead air per attempt and
 /// leaves the client in a reconnect loop.
+/// Normalize protocol DC ids to the canonical production DC number:
+/// test DCs are encoded as `10000 + dc` and DC203 is an alias of DC2.
+pub fn normalize_dc(dc: i32) -> i32 {
+    let stripped = if dc >= 10000 { dc - 10000 } else { dc };
+    if stripped == 203 { 2 } else { stripped }
+}
+
 pub fn has_ws_front(dc: i32) -> bool {
-    matches!(dc, 2 | 4)
+    matches!(normalize_dc(dc), 2 | 4)
 }
 
 pub fn ws_domains(dc: i32, is_media: bool) -> Vec<String> {
-    let resolved_dc = if dc == 203 { 2 } else { dc };
+    // Test DCs (`10002`, …) and DC203 resolve to production DC2; without
+    // this the whole WS route was skipped for them even though `kws2`
+    // answers there (see `only_dc2_and_dc4_have_a_ws_front`).
+    let resolved_dc = normalize_dc(dc);
     if !has_ws_front(resolved_dc) {
         return Vec::new();
     }
@@ -258,6 +288,7 @@ mod tests {
         }"#;
         let cfg: ProxyConfig = serde_json::from_str(legacy).expect("legacy config must parse");
         assert_eq!(cfg.pool_max_age_secs, default_pool_max_age_secs());
+        assert_eq!(cfg.pool_keepalive_secs, default_pool_keepalive_secs());
         assert!(cfg.splitter_enabled);
         assert_eq!(cfg.connect_timeout_secs, default_connect_timeout_secs());
         assert_eq!(cfg.transport, default_transport());
@@ -274,7 +305,10 @@ mod tests {
     fn only_dc2_and_dc4_have_a_ws_front() {
         assert!(has_ws_front(2));
         assert!(has_ws_front(4));
-        for dc in [1, 3, 5, 10002] {
+        // DC203 and test DCs are aliases of DC2 and therefore reachable.
+        assert!(has_ws_front(203));
+        assert!(has_ws_front(10002));
+        for dc in [1, 3, 5] {
             assert!(!has_ws_front(dc), "DC{} must have no WS front", dc);
         }
         assert_eq!(ws_domains(1, false), Vec::<String>::new());
@@ -286,6 +320,7 @@ mod tests {
         );
         // Test DCs collapse onto DC2 and therefore stay reachable.
         assert_eq!(ws_domains(10002, false), vec!["kws2.web.telegram.org"]);
+        assert_eq!(ws_domains(203, false), vec!["kws2.web.telegram.org"]);
     }
 
     #[test]

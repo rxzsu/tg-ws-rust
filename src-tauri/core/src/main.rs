@@ -32,7 +32,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     println!("Starting tg-ws-proxy-core on {}:{}", config.host, config.port);
-    println!("Secret: {}", config.secret);
+    // Never dump the proxy secret into CI/job/shell logs by default: it is the
+    // only credential an MTProto client needs. Opt in when debugging locally.
+    let print_secret = std::env::args().any(|arg| arg == "--print-secret")
+        || std::env::var_os("TG_WS_PRINT_SECRET").is_some();
+    if print_secret {
+        println!("Secret: {}", config.secret);
+    } else {
+        println!("Secret: <hidden> (pass --print-secret to show it)");
+    }
 
     run_server(config).await
 }

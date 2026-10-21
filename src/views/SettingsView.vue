@@ -220,6 +220,12 @@ function scrollToSection(id: string) {
           desc="Обход блокировок через сеть Cloudflare при сбоях прямого соединения"
         />
 
+        <ToggleRow
+          v-model="config.use_builtin_cf_domains"
+          title="Встроенные сторонние CF-домены"
+          desc="Пул чужих Cloudflare-доменов (и их обновление с GitHub). Трафик идёт через них — отключите, если нужен только ваш домен/воркер"
+        />
+
         <div class="space-y-2.5">
           <ToggleRow
             v-model="config.cfproxy_user_domain_enabled"
@@ -266,7 +272,7 @@ function scrollToSection(id: string) {
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div>
           <label class="field-label">Буфер сокета (байт)</label>
-          <NumberField v-model="config.buffer_size" :min="4096" :max="16777216" :step="65536" />
+          <NumberField v-model="config.buffer_size" :min="4096" :max="1048576" :step="65536" />
         </div>
         <div>
           <label class="field-label">Размер пула сокетов</label>
@@ -290,6 +296,10 @@ function scrollToSection(id: string) {
         <div>
           <label class="field-label">TTL сокета в пуле (сек)</label>
           <NumberField v-model="config.pool_max_age_secs" :min="10" :max="3600" :step="10" />
+        </div>
+        <div>
+          <label class="field-label">Keep-alive пула (сек, 0 — выкл)</label>
+          <NumberField v-model="config.pool_keepalive_secs" :min="0" :max="3600" :step="5" />
         </div>
         <div>
           <label class="field-label">Таймаут апстрима (сек)</label>
@@ -339,7 +349,7 @@ function scrollToSection(id: string) {
       <div class="toggle-row">
         <div class="min-w-0 pr-3">
           <div class="text-xs font-semibold text-ink-1">Тест связности дата-центров</div>
-          <div class="mt-0.5 text-[11px] text-ink-2">Проверить отклик и доступность серверов Telegram DC1–DC5</div>
+          <div class="mt-0.5 text-[11px] text-ink-2">Проверить WS-фронты DC2/DC4 и пользовательские домены</div>
         </div>
         <button
           class="btn btn-ghost"

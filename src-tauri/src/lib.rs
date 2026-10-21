@@ -36,28 +36,57 @@ fn get_config_path(app: &AppHandle) -> PathBuf {
 
 fn load_saved_config(app: &AppHandle) -> ProxyConfig {
     let path = get_config_path(app);
-    if let Ok(content) = fs::read_to_string(&path)
-        && let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content)
-    {
+    if let Some(cfg) = read_config_file(&path) {
         return cfg;
     }
     // Check fallback location in APPDATA/TgWsProxy/config.json
     if let Ok(appdata) = std::env::var("APPDATA") {
         let legacy_path = PathBuf::from(appdata).join("TgWsProxy").join("config.json");
-        if let Ok(content) = fs::read_to_string(&legacy_path)
-            && let Ok(cfg) = serde_json::from_str::<ProxyConfig>(&content)
-        {
+        if let Some(cfg) = read_config_file(&legacy_path) {
             return cfg;
         }
     }
     ProxyConfig::default()
 }
 
-fn persist_config(app: &AppHandle, cfg: &ProxyConfig) {
-    let path = get_config_path(app);
-    if let Ok(serialized) = serde_json::to_string_pretty(cfg) {
-        let _ = fs::write(path, serialized);
+/// Parse one config file. A corrupt file is preserved for recovery instead of
+/// being silently overwritten with defaults (which used to rotate the secret
+/// and break the user's Telegram link without any explanation).
+fn read_config_file(path: &std::path::Path) -> Option<ProxyConfig> {
+    let content = fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<ProxyConfig>(&content) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            log::error!("Config {} is invalid: {e}", path.display());
+            let broken = path.with_extension("json.broken");
+            if let Err(rename_err) = fs::rename(path, &broken) {
+                log::error!("Could not preserve the broken config: {rename_err}");
+            } else {
+                log::error!("Broken config preserved as {}", broken.display());
+            }
+            None
+        }
     }
+}
+
+/// Persist config atomically: write a temp file, keep a backup of the previous
+/// version, then rename into place. A crash mid-write can no longer leave a
+/// truncated `config.json` behind.
+fn persist_config(app: &AppHandle, cfg: &ProxyConfig) -> Result<(), String> {
+    let path = get_config_path(app);
+    let serialized = serde_json::to_string_pretty(cfg)
+        .map_err(|e| format!("Не удалось сериализовать настройки: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serialized)
+        .map_err(|e| format!("Не удалось записать настройки: {e}"))?;
+    if path.exists() {
+        let _ = fs::copy(&path, path.with_extension("json.bak"));
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Не удалось сохранить настройки: {e}"));
+    }
+    Ok(())
 }
 
 pub fn get_log_file_path(app: &AppHandle) -> PathBuf {
@@ -94,14 +123,49 @@ fn sensitive_domains_of(cfg: &ProxyConfig) -> Vec<String> {
 }
 
 #[cfg(desktop)]
-#[cfg(desktop)]
 async fn current_tg_link(state: &Arc<AppState>) -> String {
     let cfg = state.config.lock().await;
     generate_tg_link(&cfg)
 }
 
+/// Enable/disable the Android foreground service that keeps the proxy process
+/// alive when the app is in the background. No-op on desktop.
+#[cfg(target_os = "android")]
+fn set_foreground_service(app: &AppHandle, enabled: bool) {
+    use jni::objects::JValue;
+
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn!("Cannot toggle foreground service: no main webview");
+        return;
+    };
+    let result = window.with_webview(move |platform_webview| {
+        platform_webview.jni_handle().exec(move |env, activity, _webview| {
+            let Ok(class) = env.find_class("com/rxzsu/tg_ws_proxy/ProxyForegroundService") else {
+                log::warn!("Foreground service class not found");
+                return;
+            };
+            let method = if enabled { "start" } else { "stop" };
+            if let Err(e) = env.call_static_method(
+                class,
+                method,
+                "(Landroid/content/Context;)V",
+                &[JValue::Object(activity)],
+            ) {
+                log::warn!("Foreground service {method} failed: {e}");
+            }
+        });
+    });
+    if let Err(e) = result {
+        log::warn!("Cannot dispatch foreground service call: {e}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn set_foreground_service(_app: &AppHandle, _enabled: bool) {}
+
 /// Spawn the proxy bridge task; caller must have prepared `shutdown_tx`.
 fn spawn_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
+    set_foreground_service(&app, true);
     let stats = proxy_state.stats.clone();
     let app_err = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -118,10 +182,10 @@ fn spawn_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
             let _ = app_err.emit("proxy-error", e.to_string());
         }
         proxy_state.running.store(false, Ordering::SeqCst);
+        set_foreground_service(&app_err, false);
     });
 }
 
-#[cfg(desktop)]
 #[cfg(desktop)]
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -158,12 +222,21 @@ async fn save_config(
         return Err(msg);
     }
 
+    // Persist first: if the disk write fails the user must not be told the
+    // settings were applied. The bridge keeps running with the old config.
+    persist_config(&app, &new_config)?;
     {
         let mut cfg = state.config.lock().await;
         *cfg = new_config.clone();
     }
-    persist_config(&app, &new_config);
     core_logging::set_sensitive_domains(sensitive_domains_of(&new_config));
+
+    // Only restart a bridge that is actually running. Saving settings while
+    // the proxy is stopped used to silently start it.
+    let was_running = state.running.load(Ordering::SeqCst);
+    if !was_running {
+        return Ok(());
+    }
 
     // Seamlessly restart proxy bridge with updated settings.
     // Stop the old bridge first, then verify the port is actually free
@@ -195,6 +268,17 @@ async fn save_config(
 #[tauri::command]
 async fn is_running(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     Ok(state.running.load(Ordering::SeqCst))
+}
+
+/// Pre-flight port check for the onboarding/settings UI. Binds and releases
+/// the socket; the diagnostic is the same one `start_proxy` would show.
+#[tauri::command]
+async fn check_port(host: String, port: u16) -> Result<(), String> {
+    let addr = format!("{host}:{port}");
+    match std::net::TcpListener::bind(&addr) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(tg_ws_proxy_core::diagnose_bind_error(&e, &host, port)),
+    }
 }
 
 /// Dismiss the "last error" banner without restarting the bridge.
@@ -239,14 +323,16 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
 }
 
 #[tauri::command]
-async fn stop_proxy(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn stop_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let mut tx_guard = state.shutdown_tx.lock().await;
     if let Some(tx) = tx_guard.take() {
         let _ = tx.send(());
     }
     state.running.store(false, Ordering::SeqCst);
-    state.stats.connections_active.store(0, Ordering::SeqCst);
+    // Do not zero `connections_active` here: live sessions still decrement it
+    // while draining, and a store(0) raced with those decrements (underflow).
     state.stats.mark_stopped();
+    set_foreground_service(&app, false);
     Ok(())
 }
 
@@ -376,6 +462,8 @@ pub struct DcTestResult {
     pub dc: String,
     pub host: String,
     pub ok: bool,
+    /// DC has no `/apiws` front at all (DC1/3/5); not a connectivity failure.
+    pub no_front: bool,
     pub latency_ms: u64,
     pub message: String,
 }
@@ -383,25 +471,39 @@ pub struct DcTestResult {
 #[tauri::command]
 async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResult>, String> {
     use tg_ws_proxy_core::raw_websocket::RawWebSocket;
+    // Telegram only serves `/apiws` for DC2/DC4. DC1/3/5 answer `302` there,
+    // so probing them produced guaranteed red "timeout/error" rows that told
+    // the user nothing about their network. Report them as "no WS front"
+    // instead; DC203 is an alias of DC2.
     let mut targets = vec![
-        ("DC1".to_string(), "kws1.web.telegram.org".to_string()),
-        ("DC2".to_string(), "kws2.web.telegram.org".to_string()),
-        ("DC3".to_string(), "kws3.web.telegram.org".to_string()),
-        ("DC4".to_string(), "kws4.web.telegram.org".to_string()),
-        ("DC5".to_string(), "kws5.web.telegram.org".to_string()),
-        ("DC203".to_string(), "kws2.web.telegram.org".to_string()),
+        ("DC1".to_string(), "kws1.web.telegram.org".to_string(), true),
+        ("DC2".to_string(), "kws2.web.telegram.org".to_string(), false),
+        ("DC3".to_string(), "kws3.web.telegram.org".to_string(), true),
+        ("DC4".to_string(), "kws4.web.telegram.org".to_string(), false),
+        ("DC5".to_string(), "kws5.web.telegram.org".to_string(), true),
+        ("DC203".to_string(), "kws2.web.telegram.org".to_string(), false),
     ];
 
     for d in custom_domains {
         let clean = d.trim().to_string();
         if !clean.is_empty() {
-            targets.push(("Custom".to_string(), clean));
+            targets.push(("Custom".to_string(), clean, false));
         }
     }
 
     let mut handles = Vec::new();
-    for (dc, host) in targets {
+    for (dc, host, no_front) in targets {
         handles.push(tokio::spawn(async move {
+            if no_front {
+                return DcTestResult {
+                    dc,
+                    host,
+                    ok: false,
+                    no_front: true,
+                    latency_ms: 0,
+                    message: "Нет WS-фронта (/apiws → 302)".to_string(),
+                };
+            }
             let start = std::time::Instant::now();
             let connect_fut = RawWebSocket::connect(&host, &host, "/apiws", true);
             match tokio::time::timeout(std::time::Duration::from_secs(6), connect_fut).await {
@@ -412,8 +514,9 @@ async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResu
                         dc,
                         host,
                         ok: true,
+                        no_front: false,
                         latency_ms: ms,
-                        message: format!("{} ms (101 OK)", ms),
+                        message: format!("{} ms (WS OK)", ms),
                     }
                 }
                 Ok(Err(e)) => {
@@ -422,6 +525,7 @@ async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResu
                         dc,
                         host,
                         ok: false,
+                        no_front: false,
                         latency_ms: ms,
                         message: format!("Ошибка: {}", e),
                     }
@@ -431,6 +535,7 @@ async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResu
                         dc,
                         host,
                         ok: false,
+                        no_front: false,
                         latency_ms: 6000,
                         message: "Таймаут (6с)".to_string(),
                     }
@@ -461,10 +566,9 @@ async fn check_updates() -> Result<UpdateCheckResult, String> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     match tg_ws_proxy_core::balancer::check_latest_github_release().await {
         Ok((tag, url)) => {
-            let tag_clean = tag.trim_start_matches('v').trim();
-            let cur_clean = current_version.trim_start_matches('v').trim();
-
-            let has_update = !tag_clean.is_empty() && tag_clean != cur_clean;
+            // Compare numerically: any tag mismatch used to count as an
+            // update, so a rollback (or an older tag) was advertised too.
+            let has_update = tg_ws_proxy_core::version::is_newer_version(&tag, &current_version);
             Ok(UpdateCheckResult {
                 has_update,
                 current_version,
@@ -504,11 +608,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state.clone());
 
+    #[cfg(desktop)]
+    let launched_from_autostart = std::env::args().any(|arg| arg == "--autostart");
+    #[cfg(not(desktop))]
+    let launched_from_autostart = false;
+
     // Autostart and single-instance are desktop-only (the crates themselves
     // are only pulled in for non-mobile targets in Cargo.toml).
     #[cfg(desktop)]
     let builder = builder
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--autostart")
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the already running window instead of
             // conflicting over the proxy port (Single-Instance Guard).
@@ -744,12 +857,40 @@ pub fn run() {
             let _tray = tray_builder.build(app)?;
             }
 
+            // Re-write an existing autostart entry so builds upgraded from
+            // <=1.0.0 also get the `--autostart` flag (the old entry would
+            // still open the window on login once).
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                if app.autolaunch().is_enabled().unwrap_or(false) {
+                    let refreshed = app.autolaunch().enable();
+                    if let Err(e) = refreshed {
+                        log::warn!("Could not refresh autostart arguments: {e}");
+                    }
+                }
+            }
+
+            // The window starts hidden (avoids a flash on login). Normal
+            // launches show it; autostart launches stay in the tray.
+            if !launched_from_autostart {
+                #[cfg(desktop)]
+                show_main_window(app.handle());
+                #[cfg(mobile)]
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            } else {
+                log::info!("Started from autostart: staying in the tray");
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
             is_running,
+            check_port,
             clear_last_error,
             start_proxy,
             stop_proxy,

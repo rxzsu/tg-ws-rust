@@ -30,10 +30,19 @@ export interface ProxyConfig {
   verbose: boolean
   log_max_mb: number
   pool_max_age_secs: number
+  pool_keepalive_secs: number
   splitter_enabled: boolean
   connect_timeout_secs: number
+  use_builtin_cf_domains: boolean
   transport: string
   quic_relays: string[]
+}
+
+export interface DcRoute {
+  dc: number
+  /** `ok` | `no_front` | `failed` | `timeout` | `no_cf` */
+  state: string
+  detail: string
 }
 
 export interface TelemetrySnapshot {
@@ -51,6 +60,7 @@ export interface TelemetrySnapshot {
   speed_down_kbps: number
   uptime_secs: number
   last_error: string
+  dc_routes: DcRoute[]
 }
 
 export interface UpdateCheckResult {
@@ -64,6 +74,8 @@ export interface DcTestResult {
   dc: string
   host: string
   ok: boolean
+  /** DC1/3/5 have no `/apiws` front; shown informationally, not as an error. */
+  no_front: boolean
   latency_ms: number
   message: string
 }
@@ -109,8 +121,10 @@ const DEFAULT_CONFIG: ProxyConfig = {
   verbose: false,
   log_max_mb: 20,
   pool_max_age_secs: 120,
+  pool_keepalive_secs: 15,
   splitter_enabled: true,
   connect_timeout_secs: 10,
+  use_builtin_cf_domains: true,
   transport: 'auto',
   quic_relays: [],
 }
@@ -135,6 +149,7 @@ const telemetry = ref<TelemetrySnapshot>({
   speed_down_kbps: 0,
   uptime_secs: 0,
   last_error: '',
+  dc_routes: [],
 })
 const tgLink = ref('')
 const appVersion = ref('')
@@ -314,17 +329,21 @@ export async function clearLastError() {
   }
 }
 
-export async function saveSettings() {  try {
+/** Persist settings; returns false when the backend rejected them. */
+export async function saveSettings(): Promise<boolean> {
+  try {
     await invoke('save_config', { newConfig: config.value })
     await updateTgLink(config.value)
     isRunning.value = await invoke<boolean>('is_running')
     pushToast('Настройки применены и сохранены!')
+    return true
   } catch (err) {
     console.error('Error saving settings:', err)
     try {
       isRunning.value = await invoke<boolean>('is_running')
     } catch { /* ignore */ }
     pushToast(formatInvokeError(err), 'error', 7000)
+    return false
   }
 }
 

@@ -47,6 +47,9 @@ pub struct Balancer {
     dc_to_domain: Arc<RwLock<HashMap<i32, String>>>,
     /// Measured health per balancer domain (RTT in µs, None = failed probe).
     health: Arc<RwLock<HashMap<String, Option<u128>>>>,
+    /// When false, neither the built-in third-party domain pool nor its
+    /// GitHub refresh loop is used (privacy opt-out).
+    builtin_enabled: bool,
 }
 
 impl Default for Balancer {
@@ -57,7 +60,15 @@ impl Default for Balancer {
 
 impl Balancer {
     pub fn new() -> Self {
-        let defaults = get_default_cf_domains();
+        Self::with_builtins(true)
+    }
+
+    pub fn with_builtins(enabled: bool) -> Self {
+        let defaults = if enabled {
+            get_default_cf_domains()
+        } else {
+            Vec::new()
+        };
         let mut dc_map = HashMap::new();
         let mut rng = rand::rng();
         for &dc in &[1, 2, 3, 4, 5, 203] {
@@ -69,6 +80,7 @@ impl Balancer {
             domains: Arc::new(RwLock::new(defaults)),
             dc_to_domain: Arc::new(RwLock::new(dc_map)),
             health: Arc::new(RwLock::new(HashMap::new())),
+            builtin_enabled: enabled,
         }
     }
 
@@ -216,7 +228,10 @@ impl Balancer {
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
         });
-        // GitHub refresh loop.
+        // GitHub refresh loop (built-in third-party pool only).
+        if !self.builtin_enabled {
+            return;
+        }
         tokio::spawn(async move {
             loop {
                 if let Ok(domains) = fetch_github_cf_domains().await

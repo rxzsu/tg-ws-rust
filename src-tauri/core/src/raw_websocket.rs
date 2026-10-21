@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -7,6 +8,10 @@ use tokio_rustls::TlsConnector;
 use rand::RngExt;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use sha1::{Digest as _, Sha1};
+
+/// RFC 6455 handshake GUID.
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const OP_CONT: u8 = 0x0;
 pub const OP_TEXT: u8 = 0x1;
@@ -95,6 +100,97 @@ fn xor_mask(data: &mut [u8], mask: &[u8; 4]) {
     for (i, byte) in data.iter_mut().enumerate() {
         *byte ^= mask[i % 4];
     }
+}
+
+/// Read exactly `buf.len()` bytes, consuming any leftovers buffered after the
+/// HTTP upgrade first.
+async fn read_exact_buffered<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    leftover: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let mut needed = buf.len();
+    let mut offset = 0;
+
+    if !leftover.is_empty() {
+        let take = leftover.len().min(needed);
+        buf[..take].copy_from_slice(&leftover[..take]);
+        leftover.drain(..take);
+        needed -= take;
+        offset += take;
+    }
+
+    if needed > 0 {
+        reader.read_exact(&mut buf[offset..]).await?;
+    }
+
+    Ok(())
+}
+
+/// Read one WebSocket frame into `payload` (allocation reused by the caller).
+async fn read_frame_into<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    leftover: &mut Vec<u8>,
+    payload: &mut Vec<u8>,
+) -> io::Result<(u8, bool)> {
+    let mut hdr = [0u8; 2];
+    read_exact_buffered(reader, leftover, &mut hdr).await?;
+
+    let fin = (hdr[0] & 0x80) != 0;
+    let opcode = hdr[0] & 0x0F;
+    let masked = (hdr[1] & 0x80) != 0;
+    let raw_len = hdr[1] & 0x7F;
+
+    let length = if raw_len == 126 {
+        let mut b = [0u8; 2];
+        read_exact_buffered(reader, leftover, &mut b).await?;
+        u16::from_be_bytes(b) as usize
+    } else if raw_len == 127 {
+        let mut b = [0u8; 8];
+        read_exact_buffered(reader, leftover, &mut b).await?;
+        u64::from_be_bytes(b) as usize
+    } else {
+        raw_len as usize
+    };
+
+    if length > MAX_MESSAGE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebSocket frame too large",
+        ));
+    }
+
+    let mask_key = if masked {
+        let mut m = [0u8; 4];
+        read_exact_buffered(reader, leftover, &mut m).await?;
+        Some(m)
+    } else {
+        None
+    };
+
+    // Reuse the caller's allocation: `resize` only grows when the frame
+    // is larger than the current capacity.
+    payload.clear();
+    payload.resize(length, 0);
+    read_exact_buffered(reader, leftover, payload).await?;
+
+    if let Some(mask) = mask_key {
+        xor_mask(payload, &mask);
+    }
+
+    Ok((opcode, fin))
+}
+
+/// Case-insensitive HTTP header lookup.
+fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
 }
 
 pub struct RawWebSocket {
@@ -205,6 +301,31 @@ impl RawWebSocket {
             return Err(format!("WebSocket handshake failed: {}", resp_str.lines().next().unwrap_or("")).into());
         }
 
+        // RFC 6455: verify the server really completed the upgrade instead of
+        // trusting the status line alone.
+        if !header_value(&resp_str, "upgrade")
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        {
+            return Err("WebSocket handshake failed: missing `Upgrade: websocket`".into());
+        }
+        let mut accept_hasher = Sha1::new();
+        accept_hasher.update(ws_key.as_bytes());
+        accept_hasher.update(WS_GUID.as_bytes());
+        let expected_accept = BASE64.encode(accept_hasher.finalize());
+        match header_value(&resp_str, "sec-websocket-accept") {
+            Some(value) if value == expected_accept => {}
+            Some(value) => {
+                return Err(format!(
+                    "WebSocket handshake failed: Sec-WebSocket-Accept mismatch (got {}, expected {})",
+                    value, expected_accept
+                )
+                .into());
+            }
+            None => {
+                return Err("WebSocket handshake failed: missing Sec-WebSocket-Accept".into());
+            }
+        }
+
         let leftover = response_buf[end_idx + 4..].to_vec();
         ws.leftover = leftover;
 
@@ -226,14 +347,36 @@ impl RawWebSocket {
 
     /// Keep-alive ping for pooled sockets.
     ///
-    /// Writes and flushes a real WS ping frame, so it works for TLS streams
-    /// too (a `try_write` shortcut is impossible through rustls, and skipping
-    /// TLS sockets would let Cloudflare/ISP idle timeouts kill exactly the
-    /// connections we paid a handshake for).
-    pub async fn ping(&mut self) -> std::io::Result<()> {
-        let frame = build_frame(OP_PING, b"ka", true);
-        self.stream.write_all(&frame).await?;
-        self.stream.flush().await
+    /// Sends a real WS ping and waits for the pong, so a socket that still
+    /// accepts writes into the kernel buffer but is already dead upstream is
+    /// detected and dropped. Writes and reads go through TLS too.
+    pub async fn ping_pong(&mut self) -> io::Result<()> {
+        self.stream.write_all(&build_frame(OP_PING, b"ka", true)).await?;
+        self.stream.flush().await?;
+        let mut payload = Vec::new();
+        loop {
+            let (opcode, _) = self.read_frame(&mut payload).await?;
+            match opcode {
+                OP_PONG => return Ok(()),
+                OP_PING => {
+                    // Stay a well-behaved WS peer (rare for a bare upstream).
+                    let pong = build_frame(OP_PONG, &payload, true);
+                    self.stream.write_all(&pong).await?;
+                    self.stream.flush().await?;
+                }
+                OP_CLOSE => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "WebSocket closed during keep-alive",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn read_frame(&mut self, payload: &mut Vec<u8>) -> io::Result<(u8, bool)> {
+        read_frame_into(&mut self.stream, &mut self.leftover, payload).await
     }
 
     pub fn split(self) -> (WsReader, WsWriter) {
@@ -350,72 +493,8 @@ impl WsReader {
         Ok(false)
     }
 
-    async fn read_exact_buffered(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        let mut needed = buf.len();
-        let mut offset = 0;
-
-        if !self.leftover.is_empty() {
-            let take = self.leftover.len().min(needed);
-            buf[..take].copy_from_slice(&self.leftover[..take]);
-            self.leftover.drain(..take);
-            needed -= take;
-            offset += take;
-        }
-
-        if needed > 0 {
-            self.reader.read_exact(&mut buf[offset..]).await?;
-        }
-
-        Ok(())
-    }
-
     async fn read_frame_into(&mut self, payload: &mut Vec<u8>) -> std::io::Result<(u8, bool)> {
-        let mut hdr = [0u8; 2];
-        self.read_exact_buffered(&mut hdr).await?;
-
-        let fin = (hdr[0] & 0x80) != 0;
-        let opcode = hdr[0] & 0x0F;
-        let masked = (hdr[1] & 0x80) != 0;
-        let raw_len = hdr[1] & 0x7F;
-
-        let length = if raw_len == 126 {
-            let mut b = [0u8; 2];
-            self.read_exact_buffered(&mut b).await?;
-            u16::from_be_bytes(b) as usize
-        } else if raw_len == 127 {
-            let mut b = [0u8; 8];
-            self.read_exact_buffered(&mut b).await?;
-            u64::from_be_bytes(b) as usize
-        } else {
-            raw_len as usize
-        };
-
-        if length > MAX_MESSAGE_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WS frame too large",
-            ));
-        }
-
-        let mask_key = if masked {
-            let mut m = [0u8; 4];
-            self.read_exact_buffered(&mut m).await?;
-            Some(m)
-        } else {
-            None
-        };
-
-        // Reuse the caller's allocation: `resize` only grows when the frame
-        // is larger than the current capacity.
-        payload.clear();
-        payload.resize(length, 0);
-        self.read_exact_buffered(payload).await?;
-
-        if let Some(mask) = mask_key {
-            xor_mask(payload, &mask);
-        }
-
-        Ok((opcode, fin))
+        read_frame_into(&mut self.reader, &mut self.leftover, payload).await
     }
 }
 
