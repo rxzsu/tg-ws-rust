@@ -259,6 +259,12 @@ function scrollToSection(id: string) {
           title="Режим No-Secure"
           desc="Порт 80 без SSL-шифрования для CF proxy/worker"
         />
+
+        <ToggleRow
+          v-model="config.ech_enabled"
+          title="ECH (шифрование SNI)"
+          desc="Шифрует имя сайта в TLS-рукопожатии (Encrypted Client Hello) — DPI не видит, к какому домену идёт соединение. Нет поддержки у домена — автоматический откат на обычный TLS"
+        />
       </div>
     </SectionCard>
 

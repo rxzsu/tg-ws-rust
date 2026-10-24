@@ -244,13 +244,34 @@ impl RawWebSocket {
             let tcp = crate::net::tcp_connect(host, 443, io_buf).await?;
             let _ = tcp.set_nodelay(true);
 
-            let connector = TlsConnector::from(tls_config());
             let tls_sni = sni.unwrap_or(domain);
             let server_name = ServerName::try_from(tls_sni.to_string())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-            let tls = connector.connect(server_name, tcp).await?;
-            WsStream::Tls(Box::new(tls))
+            // ECH: hide the real SNI from DPI. If the server rejects the
+            // encrypted handshake (rotated ECH key, non-ECH edge) fall back
+            // to one plain-TLS attempt — degraded latency, not connectivity.
+            if let Some(ech_cfg) = crate::ech::tls_config_for(tls_sni).await {
+                let ech_connector = TlsConnector::from(ech_cfg);
+                match ech_connector.connect(server_name.clone(), tcp).await {
+                    Ok(tls) => {
+                        tracing::info!("ECH handshake OK for {}", tls_sni);
+                        WsStream::Tls(Box::new(tls))
+                    }
+                    Err(e) => {
+                        tracing::warn!("ECH handshake to {} failed ({}), retrying without ECH", tls_sni, e);
+                        let tcp = crate::net::tcp_connect(host, 443, io_buf).await?;
+                        let _ = tcp.set_nodelay(true);
+                        let connector = TlsConnector::from(tls_config());
+                        let tls = connector.connect(server_name, tcp).await?;
+                        WsStream::Tls(Box::new(tls))
+                    }
+                }
+            } else {
+                let connector = TlsConnector::from(tls_config());
+                let tls = connector.connect(server_name, tcp).await?;
+                WsStream::Tls(Box::new(tls))
+            }
         } else {
             let tcp = crate::net::tcp_connect(host, 80, io_buf).await?;
             let _ = tcp.set_nodelay(true);
@@ -258,7 +279,17 @@ impl RawWebSocket {
         };
 
         let mut ws = Self { stream, leftover: Vec::new() };
+        Self::complete_ws_upgrade(&mut ws, domain, path).await?;
+        Ok(ws)
+    }
 
+    /// Send the HTTP/1.1 Upgrade request and validate the 101 response
+    /// (split out so the ECH path reuses it unchanged).
+    async fn complete_ws_upgrade(
+        &mut self,
+        domain: &str,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Handshake
         let mut key_bytes = [0u8; 16];
         rand::rng().fill(&mut key_bytes);
@@ -275,14 +306,14 @@ impl RawWebSocket {
             path, domain, ws_key
         );
 
-        ws.stream.write_all(req.as_bytes()).await?;
-        ws.stream.flush().await?;
+        self.stream.write_all(req.as_bytes()).await?;
+        self.stream.flush().await?;
 
         // Read response headers with 1KB chunks (far faster than 1-byte read calls)
         let mut response_buf = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
         let end_idx = loop {
-            let n = ws.stream.read(&mut chunk).await?;
+            let n = self.stream.read(&mut chunk).await?;
             if n == 0 {
                 return Err("Connection closed during WebSocket handshake".into());
             }
@@ -327,9 +358,9 @@ impl RawWebSocket {
         }
 
         let leftover = response_buf[end_idx + 4..].to_vec();
-        ws.leftover = leftover;
+        self.leftover = leftover;
 
-        Ok(ws)
+        Ok(())
     }
 
     pub async fn send(&mut self, data: &[u8]) -> std::io::Result<()> {

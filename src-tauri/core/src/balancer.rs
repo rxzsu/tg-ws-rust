@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use rand::prelude::IndexedRandom;
@@ -246,6 +247,9 @@ impl Balancer {
     }
 }
 
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn fetch_github_cf_domains() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -255,7 +259,9 @@ async fn fetch_github_cf_domains() -> Result<Vec<String>, Box<dyn std::error::Er
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = TcpStream::connect("raw.githubusercontent.com:443").await?;
+    // Bounded: a hung GitHub connection must not stall the hourly refresh
+    // loop forever (the loop sleeps only after the fetch returns).
+    let tcp = tokio::time::timeout(GITHUB_CONNECT_TIMEOUT, TcpStream::connect("raw.githubusercontent.com:443")).await??;
     let server_name = ServerName::try_from("raw.githubusercontent.com".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
@@ -270,7 +276,7 @@ async fn fetch_github_cf_domains() -> Result<Vec<String>, Box<dyn std::error::Er
     tls.flush().await?;
 
     let mut response = Vec::new();
-    tls.read_to_end(&mut response).await?;
+    tokio::time::timeout(GITHUB_READ_TIMEOUT, tls.read_to_end(&mut response)).await??;
 
     if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
         let body = String::from_utf8_lossy(&response[pos + 4..]);
@@ -300,7 +306,7 @@ pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn s
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let tcp = TcpStream::connect("api.github.com:443").await?;
+    let tcp = tokio::time::timeout(GITHUB_CONNECT_TIMEOUT, TcpStream::connect("api.github.com:443")).await??;
     let _ = tcp.set_nodelay(true);
 
     let server_name = ServerName::try_from("api.github.com".to_string())
@@ -317,7 +323,7 @@ pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn s
     tls.flush().await?;
 
     let mut resp = Vec::new();
-    tls.read_to_end(&mut resp).await?;
+    tokio::time::timeout(GITHUB_READ_TIMEOUT, tls.read_to_end(&mut resp)).await??;
 
     if let Some(pos) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
         let body = String::from_utf8_lossy(&resp[pos + 4..]);

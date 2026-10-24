@@ -36,7 +36,10 @@ impl BufferPool {
     }
 
     /// Get a buffer with at least `cap` bytes of writable space.
-    pub fn acquire(&self, cap: usize) -> PooledBuf {
+    ///
+    /// Takes `self` by `Arc` so the returned `PooledBuf` can keep the pool
+    /// alive without any raw pointers.
+    pub fn acquire(self: &Arc<Self>, cap: usize) -> PooledBuf {
         let buf = self
             .free
             .lock()
@@ -52,7 +55,7 @@ impl BufferPool {
                 None
             })
             .unwrap_or_else(|| vec![0u8; cap]);
-        PooledBuf { buf: Some(buf), pool: self as *const BufferPool }
+        PooledBuf { buf: Some(buf), pool: Arc::clone(self) }
     }
 
     fn release(&self, buf: Vec<u8>) {
@@ -81,9 +84,10 @@ pub fn acquire_buf(cap: usize) -> PooledBuf {
 /// Deref wrapper that returns the buffer to the pool on drop.
 pub struct PooledBuf {
     buf: Option<Vec<u8>>,
-    // Raw pointer is safe: the pool outlives all bridge tasks (it lives in
-    // AppState which is never dropped while the server runs).
-    pool: *const BufferPool,
+    /// Keeps the pool alive for as long as any outstanding buffer exists;
+    /// releasing into a dropped pool would be a leak-free but silent no-op
+    /// anyway, so no unsafe aliasing is needed.
+    pool: Arc<BufferPool>,
 }
 
 impl std::ops::Deref for PooledBuf {
@@ -102,18 +106,10 @@ impl std::ops::DerefMut for PooledBuf {
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         if let Some(buf) = self.buf.take() {
-            // SAFETY: pool pointer is valid for the lifetime of the server
-            // (see struct docs). If the pool were dropped first this would
-            // dangle, so BufferPool is only ever stored in AppState.
-            unsafe { (*self.pool).release(buf) }
+            self.pool.release(buf);
         }
     }
 }
-
-// The pool is shared through Arc everywhere; the raw pointer aliasing is
-// read-only, so Send/Sync hold.
-unsafe impl Send for PooledBuf {}
-unsafe impl Sync for PooledBuf {}
 
 #[cfg(test)]
 mod tests {
@@ -134,7 +130,7 @@ mod tests {
 
     #[test]
     fn oversized_request_allocates_fresh() {
-        let pool = BufferPool::new();
+        let pool = Arc::new(BufferPool::new());
         let _small = pool.acquire(1024);
         let big = pool.acquire(512 * 1024);
         assert_eq!(big.len(), 512 * 1024);
@@ -142,7 +138,7 @@ mod tests {
 
     #[test]
     fn pool_is_bounded() {
-        let pool = BufferPool::new();
+        let pool = Arc::new(BufferPool::new());
         let mut bufs = Vec::new();
         for _ in 0..64 {
             bufs.push(pool.acquire(4096));

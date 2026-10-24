@@ -146,12 +146,26 @@ impl Stats {
             speed_up_kbps: speed_up,
             speed_down_kbps: speed_down,
             uptime_secs,
+            // Censored like file logs: last_error / dc_routes go to the GUI
+            // over IPC and must not leak the user's private CF/Worker domains.
             last_error: self
                 .last_error
                 .read()
-                .map(|g| g.clone())
+                .map(|g| crate::logging::censor_text(&g))
                 .unwrap_or_default(),
-            dc_routes: self.dc_routes.read().map(|g| g.clone()).unwrap_or_default(),
+            dc_routes: self
+                .dc_routes
+                .read()
+                .map(|g| {
+                    g.iter()
+                        .map(|r| DcRoute {
+                            dc: r.dc,
+                            state: r.state.clone(),
+                            detail: crate::logging::censor_text(&r.detail),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }

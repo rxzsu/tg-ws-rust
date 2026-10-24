@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod bufpool;
 pub mod config;
 pub mod crypto;
+pub mod ech;
 pub mod fake_tls;
 pub mod h3;
 pub mod handshake;
@@ -33,6 +34,51 @@ use crate::pool::ConnectionPool;
 use crate::raw_websocket::RawWebSocket;
 use crate::splitter::MsgSplitter;
 pub use crate::stats::{Stats, TelemetrySnapshot};
+
+/// A client that connects but never completes the MTProto handshake keeps a
+/// task and a socket busy forever; bound the whole pre-bridge exchange.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A bridge session with no traffic in either direction for this long is a
+/// half-dead socket (NAT rebinding, silent drop). Telegram clients exchange
+/// pings well within this window, so live sessions are never cut.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Millis of the last observed session activity (epoch), updated on every
+/// read in both bridge directions. Drives the idle watchdog cheaply.
+use crate::bridge::ActivityStamp;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resolve into `true` only on a real shutdown signal. `Lagged` means this
+/// receiver missed messages because of its own slow polling — it is not a
+/// stop request and previously killed healthy sessions.
+async fn shutdown_signal(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(()) => return true,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return true,
+        }
+    }
+}
+
+/// Any pre-bridge read bounded by [`HANDSHAKE_TIMEOUT`] so a silent client
+/// cannot pin the task forever.
+async fn bounded_io<F, T>(fut: F) -> std::io::Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake read timeout"))?
+}
 
 pub fn diagnose_bind_error(err: &std::io::Error, host: &str, port: u16) -> String {
     let err_kind = err.kind();
@@ -73,6 +119,7 @@ pub async fn run_server_with_stats(
     // GUI binary installs one in `main`, but the core must be safe to embed
     // anywhere — the balancer's background TLS probes hit this immediately.
     crate::quic::ensure_crypto_provider();
+    crate::ech::set_enabled(config.ech_enabled);
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = match crate::net::bind_listener(&config.host, config.port).await {
@@ -123,7 +170,7 @@ pub async fn run_server_with_stats(
                     }
                 }
             }
-            _ = shutdown_rx.recv() => {
+            _ = shutdown_signal(&mut shutdown_rx) => {
                 info!("Server shutting down gracefully");
                 break;
             }
@@ -155,6 +202,7 @@ pub async fn run_server_with_stats(
             stats.inc_active();
             let label = peer_addr.to_string();
 
+            let activity: ActivityStamp = Arc::new(std::sync::atomic::AtomicU64::new(now_millis()));
             let mut handler = Box::pin(handle_connection(
                 stream,
                 secret,
@@ -163,26 +211,44 @@ pub async fn run_server_with_stats(
                 pool,
                 balancer,
                 label.clone(),
+                activity.clone(),
             ));
 
-            tokio::select! {
-                res = &mut handler => {
-                    if let Err(e) = res {
-                        warn!("[{}] connection error: {:?}", label, e);
-                        // Surfaced on the dashboard: without this the UI just
-                        // shows "running" while Telegram silently fails.
-                        stats.set_last_error(format!("{}: {}", label, e));
+            let idle = tokio::time::sleep(IDLE_TIMEOUT);
+            tokio::pin!(idle);
+
+            loop {
+                tokio::select! {
+                    res = &mut handler => {
+                        if let Err(e) = res {
+                            warn!("[{}] connection error: {:?}", label, e);
+                            // Surfaced on the dashboard: without this the UI just
+                            // shows "running" while Telegram silently fails.
+                            stats.set_last_error(format!("{}: {}", label, e));
+                        }
+                        break;
                     }
-                }
-                _ = conn_shutdown.recv() => {
-                    // Let in-flight writes flush and the close frame go out
-                    // instead of dropping the future on the spot.
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(150),
-                        &mut handler,
-                    )
-                    .await;
-                    info!("[{}] connection closed due to proxy stop", label);
+                    _ = shutdown_signal(&mut conn_shutdown) => {
+                        // Let in-flight writes flush and the close frame go out
+                        // instead of dropping the future on the spot.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(150),
+                            &mut handler,
+                        )
+                        .await;
+                        info!("[{}] connection closed due to proxy stop", label);
+                        break;
+                    }
+                    _ = &mut idle => {
+                        // Watchdog: half-dead sessions with no traffic in either
+                        // direction are reaped; live ones reset the timer.
+                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
+                        let last = activity.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_millis().saturating_sub(last) >= IDLE_TIMEOUT.as_millis() as u64 {
+                            warn!("[{}] connection idle for {}s, closing", label, IDLE_TIMEOUT.as_secs());
+                            break;
+                        }
+                    }
                 }
             }
             stats.dec_active();
@@ -234,6 +300,7 @@ pub async fn run_server(config: ProxyConfig) -> Result<(), Box<dyn std::error::E
     run_server_with_stats(config, stats, rx).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: TcpStream,
     secret: Arc<Vec<u8>>,
@@ -242,6 +309,7 @@ async fn handle_connection(
     pool: Arc<ConnectionPool>,
     balancer: Arc<Balancer>,
     label: String,
+    activity: ActivityStamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = stream.set_nodelay(true);
 
@@ -279,16 +347,16 @@ async fn handle_connection(
     }
 
     let mut first_byte = [0u8; 1];
-    stream.read_exact(&mut first_byte).await?;
+    bounded_io(stream.read_exact(&mut first_byte)).await?;
 
     let (handshake_buf, client_reader, client_writer) = if !cfg.fake_tls_domain.is_empty() {
         if first_byte[0] == TLS_RECORD_HANDSHAKE {
             // Fake TLS client hello
             let mut rest_hdr = [0u8; 4];
-            stream.read_exact(&mut rest_hdr).await?;
+            bounded_io(stream.read_exact(&mut rest_hdr)).await?;
             let record_len = u16::from_be_bytes([rest_hdr[2], rest_hdr[3]]) as usize;
             let mut record_body = vec![0u8; record_len];
-            stream.read_exact(&mut record_body).await?;
+            bounded_io(stream.read_exact(&mut record_body)).await?;
 
             let mut client_hello = Vec::new();
             client_hello.push(first_byte[0]);
@@ -318,7 +386,7 @@ async fn handle_connection(
 
             // Read inner obfs2 handshake from TLS stream
             let mut inner_buf = [0u8; 64];
-            clt_r.read_exact(&mut inner_buf).await?;
+            bounded_io(clt_r.read_exact(&mut inner_buf)).await?;
             (inner_buf, clt_r, clt_w)
         } else {
             // Non-TLS byte on Fake TLS domain -> HTTP 301 Moved Permanently redirect
@@ -337,7 +405,7 @@ async fn handle_connection(
         }
     } else {
         let mut rest = [0u8; 63];
-        stream.read_exact(&mut rest).await?;
+        bounded_io(stream.read_exact(&mut rest)).await?;
         let mut full = [0u8; 64];
         full[0] = first_byte[0];
         full[1..].copy_from_slice(&rest);
@@ -390,9 +458,14 @@ async fn handle_connection(
         );
     }
 
+    /// How many health-ordered domains are connected to in parallel; the
+    /// first successful handshake wins. Happy-Eyeballs for the case where
+    /// one CDN front is blocked or degraded.
+    const RACE_WIDTH: usize = 3;
+
+    // Pooled sockets first: zero network cost, try every domain's queue.
     for domain in &domains {
         let attempt_start = std::time::Instant::now();
-        // Pool check
         if let Some(mut pooled) = pool.get(domain).await {
             // Auto-replenish pool in background so next client connection also gets 0ms latency
             // (bounded: replenish() skips when the queue is already full).
@@ -408,36 +481,106 @@ async fn handle_connection(
             // domain before the fresh-connect attempt below.
             balancer.record_failure(domain).await;
         }
+    }
 
-        info!("[{}] Connecting to upstream WS {}", label, domain);
+    // Fresh connects: race the top candidates in parallel instead of paying
+    // a full serial timeout per dead front.
+    if ws.is_none() && !domains.is_empty() {
         let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        let conn_res = tokio::time::timeout(ct, async {
-            RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf).await
-        }).await;
-
-        match conn_res {
-            Ok(Ok(mut socket)) => {
-                if let Err(e) = socket.send(&relay_init).await {
-                    warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
-                    // Dead endpoint: deprioritize and rotate before the next attempt.
-                    balancer.record_failure(domain).await;
-                    continue;
+        let candidates = &domains[..domains.len().min(RACE_WIDTH)];
+        type ConnectResult = Result<RawWebSocket, Box<dyn std::error::Error + Send + Sync>>;
+        let mut set: tokio::task::JoinSet<(String, Option<ConnectResult>)> =
+            tokio::task::JoinSet::new();
+        for domain in candidates {
+            let domain = domain.clone();
+            let secure = !cfg.disable_secure;
+            set.spawn(async move {
+                match tokio::time::timeout(
+                    ct,
+                    RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, io_buf),
+                )
+                .await
+                {
+                    Ok(res) => (domain, Some(res)),
+                    Err(_) => (domain, None),
                 }
+            });
+        }
+
+        let mut winner: Option<(String, RawWebSocket)> = None;
+        while let Some(joined) = set.join_next().await {
+            let Ok((domain, res)) = joined else { continue };
+            match res {
+                Some(Ok(socket)) => {
+                    info!("[{}] Race winner: upstream WS {}", label, domain);
+                    winner = Some((domain, socket));
+                    break;
+                }
+                Some(Err(e)) => {
+                    warn!("[{}] Race: connection to {} failed: {:?}", label, domain, e);
+                    balancer.record_failure(&domain).await;
+                    stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
+                }
+                None => {
+                    warn!("[{}] Race: connection to {} timed out", label, domain);
+                    balancer.record_failure(&domain).await;
+                    stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
+                }
+            }
+        }
+        // Losers still connecting are cancelled; sockets whose handshake had
+        // already completed are simply dropped (TCP close), the same as a
+        // failed attempt.
+        set.abort_all();
+
+        if let Some((domain, mut socket)) = winner {
+            let attempt_start = std::time::Instant::now();
+            if socket.send(&relay_init).await.is_ok() {
                 stats.record_dc_route(dc_id, "ok", format!("WS {}", domain));
                 stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
+                balancer.record_success(&domain, attempt_start.elapsed().as_micros()).await;
                 ws = Some(socket);
-                break;
+            } else {
+                warn!("[{}] Race winner {} refused relay init", label, domain);
+                balancer.record_failure(&domain).await;
             }
-            Ok(Err(e)) => {
-                warn!("[{}] Connection to {} failed: {:?}", label, domain, e);
-                balancer.record_failure(domain).await;
-                stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
-            }
-            Err(_) => {
-                warn!("[{}] Connection to {} timed out", label, domain);
-                balancer.record_failure(domain).await;
-                stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
+        }
+
+        // Racing covered only the first RACE_WIDTH domains; fall back to a
+        // serial pass over the rest so a large domain list still gets tried.
+        if ws.is_none() && domains.len() > RACE_WIDTH {
+            for domain in &domains[RACE_WIDTH..] {
+                let attempt_start = std::time::Instant::now();
+                info!("[{}] Connecting to upstream WS {}", label, domain);
+                let conn_res = tokio::time::timeout(
+                    ct,
+                    RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf),
+                )
+                .await;
+                match conn_res {
+                    Ok(Ok(mut socket)) => {
+                        if let Err(e) = socket.send(&relay_init).await {
+                            warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
+                            balancer.record_failure(domain).await;
+                            continue;
+                        }
+                        stats.record_dc_route(dc_id, "ok", format!("WS {}", domain));
+                        stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
+                        ws = Some(socket);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("[{}] Connection to {} failed: {:?}", label, domain, e);
+                        balancer.record_failure(domain).await;
+                        stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
+                    }
+                    Err(_) => {
+                        warn!("[{}] Connection to {} timed out", label, domain);
+                        balancer.record_failure(domain).await;
+                        stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
+                    }
+                }
             }
         }
     }
@@ -481,6 +624,7 @@ async fn handle_connection(
                                 stats,
                                 label,
                                 io_buf,
+                                activity,
                             )
                             .await;
                         }
@@ -514,6 +658,7 @@ async fn handle_connection(
                                 stats,
                                 label,
                                 io_buf,
+                                activity,
                             )
                             .await;
                         }
@@ -529,6 +674,8 @@ async fn handle_connection(
 
     // 2. Fallback: CF Worker / CF Domains / Dynamic Balancer if direct WS failed
     if ws.is_none() && cfg.fallback_cfproxy {
+        // Same bounded-attempt window the direct path above uses.
+        let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
         let fallback_ip = get_default_dc_ip(dc_id, is_test);
 
         // Try CF Worker domains
@@ -537,7 +684,10 @@ async fn handle_connection(
                 let media_flag = if hs.is_media { 1 } else { 0 };
                 let path = format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, media_flag);
                 info!("[{}] Fallback CF Worker: {} -> {}", label, worker_domain, path);
-                if let Ok(mut worker_ws) = RawWebSocket::connect_with_buf(worker_domain, worker_domain, &path, !cfg.disable_secure, io_buf).await
+                // Bounded like the direct path above: a hung handshake to one
+                // fallback domain must not stall the whole fallback chain.
+                let conn = tokio::time::timeout(ct, RawWebSocket::connect_with_buf(worker_domain, worker_domain, &path, !cfg.disable_secure, io_buf)).await;
+                if let Ok(Ok(mut worker_ws)) = conn
                     && worker_ws.send(&relay_init).await.is_ok()
                 {
                     stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -551,7 +701,13 @@ async fn handle_connection(
         if ws.is_none() {
             for cf_domain in &cfg.cfproxy_user_domains {
                 info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
-                let conn = RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf).await;
+                let conn = match tokio::time::timeout(ct, RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("[{}] Fallback User CF Domain {} timed out", label, cf_domain);
+                        continue;
+                    }
+                };
                 if let Ok(mut cf_ws) = conn
                     && cf_ws.send(&relay_init).await.is_ok()
                 {
@@ -568,7 +724,14 @@ async fn handle_connection(
             for b_domain in balancer_domains {
                 let host = format!("kws{}.{}", dc_id, b_domain);
                 info!("[{}] Fallback Balancer Domain: {}", label, host);
-                let conn = RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf).await;
+                let conn = match tokio::time::timeout(ct, RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("[{}] Fallback Balancer Domain {} timed out", label, host);
+                        balancer.record_failure(&b_domain).await;
+                        continue;
+                    }
+                };
 
                 if let Ok(mut b_ws) = conn {
                     if b_ws.send(&relay_init).await.is_ok() {
@@ -606,7 +769,7 @@ async fn handle_connection(
                 stats.connections_tcp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("[{}] Direct TCP Fallback connected to {}:443", label, target_ip);
                 let (remote_reader, remote_writer) = remote_stream.into_split();
-                return bridge_tcp_fallback(client_reader, client_writer, RemoteIo { reader: remote_reader, writer: remote_writer }, ctx, stats, label, io_buf).await;
+                return bridge_tcp_fallback(client_reader, client_writer, RemoteIo { reader: remote_reader, writer: remote_writer }, ctx, stats, label, io_buf, activity).await;
             }
         } else {
             warn!("[{}] Direct TCP Fallback connection to {}:443 failed", label, target_ip);
@@ -651,6 +814,7 @@ async fn handle_connection(
         BridgeOptions { splitter, io_buf },
         stats,
         label,
+        activity,
     )
     .await?;
 

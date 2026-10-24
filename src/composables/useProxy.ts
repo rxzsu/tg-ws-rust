@@ -36,6 +36,7 @@ export interface ProxyConfig {
   use_builtin_cf_domains: boolean
   transport: string
   quic_relays: string[]
+  ech_enabled: boolean
 }
 
 export interface DcRoute {
@@ -127,6 +128,7 @@ const DEFAULT_CONFIG: ProxyConfig = {
   use_builtin_cf_domains: true,
   transport: 'auto',
   quic_relays: [],
+  ech_enabled: true,
 }
 
 const MAX_HISTORY = 90
@@ -169,6 +171,7 @@ const testResults = ref<DcTestResult[]>([])
 const showTestModal = ref(false)
 
 let initialized = false
+let unlistenTelemetry: (() => void) | null = null
 
 // ── Helpers ───────────────────────────────────────────────────────────
 export function splitList(text: string): string[] {
@@ -251,7 +254,10 @@ export async function initProxy(): Promise<boolean> {
     console.error('Failed to load status:', err)
   }
 
-  listen<TelemetrySnapshot>('telemetry-update', (event) => {
+  // Re-listen after HMR (module reload resets `initialized`): drop the old
+  // subscription first so telemetry handlers never stack up.
+  unlistenTelemetry?.()
+  unlistenTelemetry = await listen<TelemetrySnapshot>('telemetry-update', (event) => {
     const payload = event.payload
     if (!isRunning.value) {
       payload.connections_active = 0

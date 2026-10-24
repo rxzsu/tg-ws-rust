@@ -53,6 +53,13 @@ pub struct ProxyConfig {
     /// User-run QUIC relays as `host:port` (experimental, v1.0 phase 3).
     #[serde(default)]
     pub quic_relays: Vec<String>,
+    /// Encrypted Client Hello (ECH) on upstream TLS connections: hides the
+    /// real SNI (`kws*.web.telegram.org`, user CF domains) from DPI by
+    /// encrypting the ClientHello with the ECH config published in the
+    /// domain's DNS HTTPS record. Falls back to plain TLS automatically when
+    /// a domain offers no ECH config or the handshake is rejected.
+    #[serde(default = "default_true")]
+    pub ech_enabled: bool,
 }
 
 fn default_pool_max_age_secs() -> u64 {
@@ -111,6 +118,7 @@ impl Default for ProxyConfig {
             use_builtin_cf_domains: true,
             transport: default_transport(),
             quic_relays: Vec::new(),
+            ech_enabled: true,
         }
     }
 }

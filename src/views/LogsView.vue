@@ -10,10 +10,31 @@ const isLoadingLogs = ref(false)
 const logContainer = ref<HTMLElement | null>(null)
 let pollTimer: number | null = null
 
-async function fetchLogs() {
+interface LogTail {
+  lines: string[]
+  offset: number
+  truncated: boolean
+}
+
+const MAX_LINES = 800
+// null = first load (full refresh); afterwards an incremental byte offset.
+let logOffset: number | null = null
+
+async function fetchLogs(full = false) {
   isLoadingLogs.value = true
   try {
-    logLines.value = await invoke<string[]>('get_recent_logs')
+    const tail = await invoke<LogTail>('get_log_tail', {
+      offset: full ? null : logOffset,
+    })
+    if (tail.truncated || logOffset === null) {
+      logLines.value = tail.lines
+    } else if (tail.lines.length) {
+      logLines.value.push(...tail.lines)
+      if (logLines.value.length > MAX_LINES) {
+        logLines.value.splice(0, logLines.value.length - MAX_LINES)
+      }
+    }
+    logOffset = tail.offset
   } catch (e) {
     console.error('Failed to load logs:', e)
   } finally {
@@ -33,6 +54,7 @@ async function clearLogs() {
   try {
     await invoke('clear_logs')
     logLines.value = []
+    logOffset = null
     pushToast('Логи очищены!')
   } catch (e) {
     pushToast(formatInvokeError(e), 'error')
@@ -53,8 +75,8 @@ watch(logLines, async () => {
 })
 
 onMounted(() => {
-  fetchLogs()
-  pollTimer = window.setInterval(fetchLogs, 2000)
+  fetchLogs(true)
+  pollTimer = window.setInterval(() => fetchLogs(false), 2000)
 })
 
 onUnmounted(() => {
@@ -77,7 +99,7 @@ onUnmounted(() => {
         class="btn btn-ghost"
         :disabled="isLoadingLogs"
         title="Обновить логи"
-        @click="fetchLogs"
+        @click="fetchLogs(true)"
       >
         <RefreshCw class="h-3.5 w-3.5" :class="isLoadingLogs ? 'animate-spin' : ''" />
         <span>Обновить</span>

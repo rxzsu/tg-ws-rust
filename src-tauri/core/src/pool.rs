@@ -38,13 +38,21 @@ impl ConnectionPool {
     fn queue_for(&self, domain: &str) -> DomainQueue {
         // Fast path: read lock.
         {
-            let map = self.domains.read().expect("pool map poisoned");
+            // `into_inner` on poison: a panicked task holding the map must not
+            // turn every later connection into a panic too.
+            let map = match self.domains.read() {
+                Ok(m) => m,
+                Err(p) => p.into_inner(),
+            };
             if let Some(q) = map.get(domain) {
                 return q.clone();
             }
         }
         // Slow path: create the queue once.
-        let mut map = self.domains.write().expect("pool map poisoned");
+        let mut map = match self.domains.write() {
+            Ok(m) => m,
+            Err(p) => p.into_inner(),
+        };
         map.entry(domain.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
             .clone()
@@ -161,13 +169,26 @@ impl ConnectionPool {
         if self.max_per_key == 0 {
             return;
         }
-        let q = self.queue_for(&domain);
-        let mut list = match q.lock() {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        if list.len() < self.max_per_key {
-            list.push_back((ws, Instant::now()));
+        let mut overflow: Option<RawWebSocket> = None;
+        {
+            let q = self.queue_for(&domain);
+            let mut list = match q.lock() {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            if list.len() < self.max_per_key {
+                list.push_back((ws, Instant::now()));
+            } else {
+                overflow = Some(ws);
+            }
+        }
+        if let Some(mut ws) = overflow {
+            // Queue overflowed (e.g. several replenish tasks raced): the
+            // socket did a full TCP+TLS+WS handshake that no client will
+            // ever take — close it instead of silently leaking it to the
+            // idle timeout. Closed outside the queue lock so awaiting the
+            // close frame never blocks other pool users.
+            let _ = ws.close().await;
         }
     }
 

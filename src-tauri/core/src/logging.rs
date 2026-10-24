@@ -59,7 +59,8 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) {
 }
 
 struct RotatingFile {
-    file: fs::File,
+    /// `None` only transiently between close and reopen during rotation.
+    file: Option<fs::File>,
     path: PathBuf,
     max_bytes: u64,
 }
@@ -72,29 +73,47 @@ impl RotatingFile {
         rotate_if_needed(path, max_bytes);
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
-            file,
+            file: Some(file),
             path: path.to_path_buf(),
             max_bytes,
         })
     }
 
+    fn reopen(&mut self) -> io::Result<&mut fs::File> {
+        let file = self.file.insert(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        Ok(file)
+    }
+
     fn write_censored(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Rotate *before* writing when the file already exceeds the limit.
-        if let Ok(meta) = self.file.metadata()
+        if let Ok(meta) = fs::metadata(&self.path)
             && meta.len() >= self.max_bytes
         {
-            drop(fs::rename(&self.path, self.path.with_extension("log.1")));
-            self.file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.path)?;
+            // Close the current handle first: on Windows an open append
+            // handle makes fs::rename fail with a sharing violation, which
+            // silently disabled rotation and let proxy.log grow unbounded.
+            drop(self.file.take());
+            let backup = self.path.with_extension("log.1");
+            let _ = fs::remove_file(&backup);
+            // If the rename fails (file locked by an external viewer) we
+            // simply keep appending; rotation is retried on the next write.
+            let _ = fs::rename(&self.path, &backup);
+            self.reopen()?;
         }
         let text = String::from_utf8_lossy(buf);
         let censored = censor_text(&text);
         use std::io::Write;
-        self.file.write_all(censored.as_bytes())?;
-        self.file.flush()?;
+        let file = match self.file.as_mut() {
+            Some(f) => f,
+            None => self.reopen()?,
+        };
+        file.write_all(censored.as_bytes())?;
+        file.flush()?;
         Ok(buf.len())
     }
 }

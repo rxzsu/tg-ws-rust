@@ -9,6 +9,19 @@ use crate::splitter::MsgSplitter;
 use crate::stats::Stats;
 use tracing::{debug, info};
 
+/// Millis of the last observed session activity (epoch). Updated on every
+/// read in both directions; the session watchdog reaps the connection when
+/// it stops moving.
+pub type ActivityStamp = Arc<std::sync::atomic::AtomicU64>;
+
+fn touch(activity: &ActivityStamp) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    activity.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Optional per-bridge tuning knobs (keeps the bridge signatures small).
 pub struct BridgeOptions {
     pub splitter: Option<MsgSplitter>,
@@ -22,6 +35,7 @@ pub struct RemoteIo<R, W> {
     pub writer: W,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_ws_reencrypt(
     mut client_reader: ClientReader,
     mut client_writer: ClientWriter,
@@ -30,6 +44,7 @@ pub async fn bridge_ws_reencrypt(
     opts: BridgeOptions,
     stats: Arc<Stats>,
     label: String,
+    activity: ActivityStamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws_reader, mut ws_writer) = ws.split();
     // Single allocation sized from config instead of a hardcoded 64 KB.
@@ -43,6 +58,8 @@ pub async fn bridge_ws_reencrypt(
 
     let stats_up = stats.clone();
     let stats_down = stats.clone();
+    let activity_up = activity.clone();
+    let activity_down = activity.clone();
     let label_up = label.clone();
     let label_down = label.clone();
 
@@ -52,7 +69,10 @@ pub async fn bridge_ws_reencrypt(
         loop {
             let n = match client_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    touch(&activity_up);
+                    n
+                }
                 Err(e) => {
                     debug!("[{}] client read error: {:?}", label_up, e);
                     break;
@@ -97,6 +117,7 @@ pub async fn bridge_ws_reencrypt(
         loop {
             match ws_reader.recv_into(&mut msg).await {
                 Ok(true) => {
+                    touch(&activity_down);
                     let n = msg.len();
                     stats_down.add_down(n);
 
@@ -128,6 +149,7 @@ pub async fn bridge_ws_reencrypt(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_tcp_fallback<R, W>(
     mut client_reader: ClientReader,
     mut client_writer: ClientWriter,
@@ -136,6 +158,7 @@ pub async fn bridge_tcp_fallback<R, W>(
     stats: Arc<Stats>,
     label: String,
     io_buf: usize,
+    activity: ActivityStamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -152,6 +175,8 @@ where
 
     let stats_up = stats.clone();
     let stats_down = stats.clone();
+    let activity_up = activity.clone();
+    let activity_down = activity.clone();
     let label_up = label.clone();
     let label_down = label.clone();
 
@@ -161,7 +186,10 @@ where
         loop {
             let n = match client_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    touch(&activity_up);
+                    n
+                }
                 Err(e) => {
                     debug!("[{}] client read error in TCP fallback: {:?}", label_up, e);
                     break;
@@ -185,7 +213,10 @@ where
         loop {
             let n = match remote_reader.read(&mut buf[..]).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    touch(&activity_down);
+                    n
+                }
                 Err(e) => {
                     debug!("[{}] remote TCP read error in TCP fallback: {:?}", label_down, e);
                     break;

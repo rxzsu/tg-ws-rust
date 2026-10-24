@@ -1,6 +1,7 @@
 <resources>
     <string name="app_name">"tg-ws-proxy"</string>
     <string name="main_activity_title">"tg-ws-proxy"</string>
+    <string name="tile_label">"Прокси"</string>
     <string name="fgs_title">"TG WS Proxy"</string>
     <string name="fgs_text">"Мост активен — прокси работает в фоне"</string>
     <string name="fgs_channel">"Работа моста"</string>

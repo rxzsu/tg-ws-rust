@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, type Component } from 'vue'
+import { ref, onMounted, onUnmounted, type Component } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Download, LayoutDashboard, Settings2, ScrollText, LifeBuoy, Wifi } from 'lucide-vue-next'
@@ -28,19 +28,30 @@ const {
   showTestModal,
 } = useProxy()
 
+// Unlisten functions: without calling them on unmount, every HMR pass (and
+// any future remount) stacks another copy of these listeners.
+const unlisteners: Array<() => void> = []
+
 onMounted(async () => {
   const firstRun = await initProxy()
   showWizard.value = firstRun
 
-  listen<string>('proxy-error', (event) => {
-    console.error('Proxy error:', event.payload)
-    isRunning.value = false
-    pushToast(event.payload, 'error', 7000)
-  })
+  unlisteners.push(
+    await listen<string>('proxy-error', (event) => {
+      console.error('Proxy error:', event.payload)
+      isRunning.value = false
+      pushToast(event.payload, 'error', 7000)
+    }),
+  )
+  unlisteners.push(
+    await listen('open-settings', () => {
+      activeTab.value = 'settings'
+    }),
+  )
+})
 
-  listen('open-settings', () => {
-    activeTab.value = 'settings'
-  })
+onUnmounted(() => {
+  for (const unlisten of unlisteners.splice(0)) unlisten()
 })
 
 const views: Record<TabId, Component> = {

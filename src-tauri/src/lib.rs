@@ -18,11 +18,19 @@ use tg_ws_proxy_core::stats::Stats;
 use tokio::sync::Mutex;
 
 struct AppState {
-    running: AtomicBool,
+    running: Arc<AtomicBool>,
     config: Mutex<ProxyConfig>,
     stats: Arc<Stats>,
     shutdown_tx: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
+    /// Handle of the running bridge task. Stop waits for it instead of a
+    /// fixed sleep, so a fast stop→start no longer races the old bridge for
+    /// the listening port.
+    bridge_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
+
+/// Global handle so native callbacks that have no Tauri context (the Android
+/// Quick Settings tile JNI entry) can drive the bridge.
+static APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 fn get_config_path(app: &AppHandle) -> PathBuf {
     let mut path = app
@@ -163,27 +171,117 @@ fn set_foreground_service(app: &AppHandle, enabled: bool) {
 #[cfg(not(target_os = "android"))]
 fn set_foreground_service(_app: &AppHandle, _enabled: bool) {}
 
-/// Spawn the proxy bridge task; caller must have prepared `shutdown_tx`.
-fn spawn_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
-    set_foreground_service(&app, true);
-    let stats = proxy_state.stats.clone();
-    let app_err = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
-        {
-            let mut tx_guard = proxy_state.shutdown_tx.lock().await;
-            *tx_guard = Some(shutdown_tx);
+/// Start/stop the bridge on behalf of the Android Quick Settings tile.
+/// Mirrors `start_proxy`/`stop_proxy` including validation and diagnostics.
+#[cfg(target_os = "android")]
+async fn toggle_bridge_from_tile(app: AppHandle, on: bool) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    if on {
+        if state.running.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        proxy_state.running.store(true, Ordering::SeqCst);
+        let cfg = state.config.lock().await.clone();
+        if let Err(msg) = tg_ws_proxy_core::config::validate(&cfg) {
+            let _ = app.emit("proxy-error", msg.clone());
+            return Err(msg);
+        }
+        let addr = format!("{}:{}", cfg.host, cfg.port);
+        if let Err(e) = std::net::TcpListener::bind(&addr) {
+            let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &cfg.host, cfg.port);
+            let _ = app.emit("proxy-error", diag.clone());
+            return Err(diag);
+        }
+        start_bridge(app, state, cfg).await;
+        Ok(())
+    } else {
+        stop_bridge(&state).await;
+        set_foreground_service(&app, false);
+        Ok(())
+    }
+}
+
+/// JNI entry called by `ProxyTileService.RustBridge.nativeToggleProxy`.
+/// Returns false when the Rust runtime is not up (cold process); the Kotlin
+/// side then falls back to launching MainActivity, whose startup auto-starts
+/// the bridge.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    on: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    let Some(app) = APP_HANDLE.get() else {
+        return 0;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = toggle_bridge_from_tile(app, on != 0).await {
+            log::warn!("Tile toggle failed: {e}");
+        }
+    });
+    1
+}
+
+/// Spawn the proxy bridge task. The shutdown channel is created and stored
+/// *before* the task spawns, so a stop issued immediately after start always
+/// reaches the bridge (previously the channel was installed inside the task,
+/// leaving a window where stop silently did nothing).
+async fn start_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
+    {
+        let mut tx_guard = proxy_state.shutdown_tx.lock().await;
+        *tx_guard = Some(shutdown_tx);
+    }
+    // Pre-flight bind already succeeded in the caller; from here on the
+    // start is committed. Swap guards against a double start.
+    if proxy_state.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_foreground_service(&app, true);
+
+    let stats = proxy_state.stats.clone();
+    let running = proxy_state.running.clone();
+    let app_err = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) =
             tg_ws_proxy_core::run_server_with_stats(cfg, stats, shutdown_rx).await
         {
             log::error!("Server error: {:?}", e);
             let _ = app_err.emit("proxy-error", e.to_string());
         }
-        proxy_state.running.store(false, Ordering::SeqCst);
+        running.store(false, Ordering::SeqCst);
         set_foreground_service(&app_err, false);
     });
+    *proxy_state.bridge_task.lock().await = Some(handle);
+}
+
+/// Send the shutdown signal, then wait for the bridge task to actually
+/// finish (it drains live sessions for up to ~1s) before returning. Aborts
+/// the task if it somehow outlives the grace window.
+async fn stop_bridge(proxy_state: &Arc<AppState>) {
+    {
+        let mut tx_guard = proxy_state.shutdown_tx.lock().await;
+        if let Some(tx) = tx_guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    let handle = proxy_state.bridge_task.lock().await.take();
+    proxy_state.running.store(false, Ordering::SeqCst);
+    // Do not zero `connections_active` here: live sessions still decrement it
+    // while draining, and a store(0) raced with those decrements (underflow).
+    if let Some(mut handle) = handle {
+        // Drain is bounded server-side (1s session grace); allow extra
+        // headroom, then force-quit a wedged task.
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            log::warn!("Bridge task did not finish within 5s of shutdown, aborting");
+            handle.abort();
+        }
+    }
+    proxy_state.stats.mark_stopped();
 }
 
 #[cfg(desktop)]
@@ -239,17 +337,10 @@ async fn save_config(
     }
 
     // Seamlessly restart proxy bridge with updated settings.
-    // Stop the old bridge first, then verify the port is actually free
-    // so the user gets a clear "port busy" diagnostic instead of a
-    // silent failure inside the background task.
-    {
-        let mut tx_guard = state.shutdown_tx.lock().await;
-        if let Some(tx) = tx_guard.take() {
-            let _ = tx.send(());
-        }
-    }
-    state.running.store(false, Ordering::SeqCst);
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    // Stop the old bridge first and *wait* for it (bounded), then verify the
+    // port is actually free so the user gets a clear "port busy" diagnostic
+    // instead of a silent failure inside the background task.
+    stop_bridge(&state).await;
 
     let addr = format!("{}:{}", new_config.host, new_config.port);
     if let Err(e) = std::net::TcpListener::bind(&addr) {
@@ -260,7 +351,7 @@ async fn save_config(
     }
 
     let proxy_state = state.inner().clone();
-    spawn_bridge(app, proxy_state, new_config);
+    start_bridge(app, proxy_state, new_config).await;
 
     Ok(())
 }
@@ -317,39 +408,94 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     }
 
     let proxy_state = state.inner().clone();
-    spawn_bridge(app, proxy_state, cfg);
+    start_bridge(app, proxy_state, cfg).await;
 
     Ok("Started".into())
 }
 
 #[tauri::command]
 async fn stop_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut tx_guard = state.shutdown_tx.lock().await;
-    if let Some(tx) = tx_guard.take() {
-        let _ = tx.send(());
-    }
-    state.running.store(false, Ordering::SeqCst);
-    // Do not zero `connections_active` here: live sessions still decrement it
-    // while draining, and a store(0) raced with those decrements (underflow).
-    state.stats.mark_stopped();
+    stop_bridge(state.inner()).await;
     set_foreground_service(&app, false);
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct LogTail {
+    pub lines: Vec<String>,
+    /// Byte offset the frontend passes back on the next poll.
+    pub offset: u64,
+    /// True when the view was rebuilt from scratch (rotation, clear, or the
+    /// first call): the frontend must replace its buffer instead of appending.
+    pub truncated: bool,
+}
+
+/// How many bytes of the file end to re-read on a full refresh. Enough for
+/// ~1000 log lines; prevents re-reading a (potentially hundreds-of-MB) file.
+const LOG_REFRESH_WINDOW: u64 = 256 * 1024;
+/// Hard cap on the incremental payload so a pathological single-line flood
+/// cannot balloon one IPC message.
+const LOG_MAX_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Incremental log tail. The frontend polls with the offset from the previous
+/// call; only the newly appended bytes cross the IPC boundary, instead of the
+/// whole file every 2 seconds (which used to block a tokio worker on large
+/// logs and re-render the whole view).
 #[tauri::command]
-async fn get_recent_logs(app: AppHandle) -> Result<Vec<String>, String> {
+async fn get_log_tail(app: AppHandle, offset: Option<u64>) -> Result<LogTail, String> {
     let path = get_log_file_path(&app);
+    tokio::task::spawn_blocking(move || read_log_tail(&path, offset.unwrap_or(0)))
+        .await
+        .map_err(|e| format!("Не удалось прочитать логи: {e}"))?
+}
+
+fn read_log_tail(path: &std::path::Path, offset: u64) -> Result<LogTail, String> {
+    use std::io::{Read, Seek, SeekFrom};
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(LogTail { lines: Vec::new(), offset: 0, truncated: true });
     }
-    match fs::read_to_string(&path) {
-        Ok(content) => {
-            let lines: Vec<String> = content.lines().rev().take(300).map(|s| s.to_string()).collect();
-            let mut lines = lines;
-            lines.reverse();
-            Ok(lines)
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("Не удалось открыть файл логов: {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("Не удалось получить размер логов: {e}"))?
+        .len();
+
+    // Rotation or clear happened since the last poll: full refresh.
+    let truncated = offset == 0 || size < offset;
+
+    if truncated {
+        let start = size.saturating_sub(LOG_REFRESH_WINDOW);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("Не удалось прочитать логи: {e}"))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("Не удалось прочитать логи: {e}"))?;
+        // Drop the possibly-torn first line when we seeked into the middle.
+        let text = String::from_utf8_lossy(&bytes);
+        let text = if start > 0 && !text.starts_with('\n') {
+            text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+        } else {
+            text.as_ref()
+        };
+        let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+        Ok(LogTail { lines, offset: size, truncated: true })
+    } else {
+        let end = size.min(offset + LOG_MAX_TAIL_BYTES);
+        let len = (end - offset) as usize;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Не удалось прочитать логи: {e}"))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)
+            .map_err(|e| format!("Не удалось прочитать логи: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+        // A torn last line (crash mid-write) becomes an empty fragment; drop
+        // it so the view doesn't show a phantom blank entry.
+        if !bytes.ends_with(b"\n") && !lines.is_empty() {
+            lines.pop();
         }
-        Err(e) => Err(format!("Не удалось прочитать файл логов: {:?}", e)),
+        Ok(LogTail { lines, offset: end, truncated: false })
     }
 }
 
@@ -371,8 +517,19 @@ async fn clear_logs(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Only schemes the app itself produces are allowed: the tg:// deep link and
+/// GitHub release pages. A compromised webview must not be able to make the
+/// OS open arbitrary handlers (file:, ms-settings:, executables, ...).
+fn is_allowed_external_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("tg://") || lower.starts_with("https://")
+}
+
 #[tauri::command]
 async fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    if !is_allowed_external_url(&url) {
+        return Err(format!("Схема ссылки не разрешена: {}", url));
+    }
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("Не удалось открыть ссылку: {e}"))
@@ -380,14 +537,7 @@ async fn open_url(app: AppHandle, url: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn restart_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    {
-        let mut tx_guard = state.shutdown_tx.lock().await;
-        if let Some(tx) = tx_guard.take() {
-            let _ = tx.send(());
-        }
-    }
-    state.running.store(false, Ordering::SeqCst);
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    stop_bridge(state.inner()).await;
 
     let cfg = {
         let guard = state.config.lock().await;
@@ -402,7 +552,7 @@ async fn restart_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Resul
     }
 
     let proxy_state = state.inner().clone();
-    spawn_bridge(app, proxy_state, cfg);
+    start_bridge(app, proxy_state, cfg).await;
     Ok("Restarted".into())
 }
 
@@ -564,8 +714,14 @@ pub struct UpdateCheckResult {
 #[tauri::command]
 async fn check_updates() -> Result<UpdateCheckResult, String> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    match tg_ws_proxy_core::balancer::check_latest_github_release().await {
-        Ok((tag, url)) => {
+    // Bounded: the button must never spin forever on a hung connection.
+    let result = tokio::time::timeout(
+        Duration::from_secs(25),
+        tg_ws_proxy_core::balancer::check_latest_github_release(),
+    )
+    .await;
+    match result {
+        Ok(Ok((tag, url))) => {
             // Compare numerically: any tag mismatch used to count as an
             // update, so a rollback (or an older tag) was advertised too.
             let has_update = tg_ws_proxy_core::version::is_newer_version(&tag, &current_version);
@@ -576,8 +732,17 @@ async fn check_updates() -> Result<UpdateCheckResult, String> {
                 release_url: url,
             })
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::warn!("GitHub update check failed: {:?}", e);
+            Ok(UpdateCheckResult {
+                has_update: false,
+                current_version: current_version.clone(),
+                latest_version: current_version,
+                release_url: "https://github.com/rxzsu/tg-ws-rust/releases".to_string(),
+            })
+        }
+        Err(_) => {
+            log::warn!("GitHub update check timed out");
             Ok(UpdateCheckResult {
                 has_update: false,
                 current_version: current_version.clone(),
@@ -597,10 +762,11 @@ fn get_link_host(host: String) -> String {
 pub fn run() {
     let stats = Arc::new(Stats::new());
     let state = Arc::new(AppState {
-        running: AtomicBool::new(false),
+        running: Arc::new(AtomicBool::new(false)),
         config: Mutex::new(ProxyConfig::default()),
         stats: stats.clone(),
         shutdown_tx: Mutex::new(None),
+        bridge_task: Mutex::new(None),
     });
 
     let builder = tauri::Builder::default()
@@ -630,6 +796,7 @@ pub fn run() {
 
     builder
         .setup(move |app| {
+            let _ = APP_HANDLE.set(app.handle().clone());
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -688,36 +855,33 @@ pub fn run() {
                     let _ = auto_handle.emit("proxy-error", diag);
                     return;
                 }
-                auto_state.running.store(true, Ordering::SeqCst);
-                let stats = auto_state.stats.clone();
-                let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
-                {
-                    let mut tx_guard = auto_state.shutdown_tx.lock().await;
-                    *tx_guard = Some(shutdown_tx);
-                }
-                if let Err(e) = tg_ws_proxy_core::run_server_with_stats(
-                    cfg_snapshot,
-                    stats,
-                    shutdown_rx,
-                )
-                .await
-                {
-                    log::error!("Auto-start server error: {:?}", e);
-                    let _ = auto_handle.emit("proxy-error", e.to_string());
-                }
-                auto_state.running.store(false, Ordering::SeqCst);
+                start_bridge(auto_handle, auto_state, cfg_snapshot).await;
             });
 
-            // Telemetry broadcast loop (every 1 second)
+            // Telemetry broadcast loop. Emits every second only while the
+            // bridge is running *and* the window is visible; otherwise it
+            // falls back to a 5s heartbeat (and skips entirely while hidden)
+            // so an idle tray-only app doesn't burn battery re-rendering
+            // unchanged zeros — especially on Android.
             let app_handle = app.handle().clone();
             let stats_bg = stats.clone();
+            let running_flag = app.state::<Arc<AppState>>().inner().running.clone();
             tauri::async_runtime::spawn(async move {
                 let mut prev_up = 0u64;
                 let mut prev_down = 0u64;
                 let mut prev_time = Instant::now();
 
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let running = running_flag.load(Ordering::Relaxed);
+                    let visible = app_handle
+                        .get_webview_window("main")
+                        .and_then(|w| w.is_visible().ok())
+                        .unwrap_or(true);
+                    let tick = if running && visible { 1 } else { 5 };
+                    tokio::time::sleep(Duration::from_secs(tick)).await;
+                    if !visible {
+                        continue;
+                    }
                     let now = Instant::now();
                     let elapsed = now.duration_since(prev_time).as_secs_f64();
                     if elapsed <= 0.0 {
@@ -807,14 +971,7 @@ pub fn run() {
                         let handle = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let st = handle.state::<Arc<AppState>>().inner().clone();
-                            {
-                                let mut tx_guard = st.shutdown_tx.lock().await;
-                                if let Some(tx) = tx_guard.take() {
-                                    let _ = tx.send(());
-                                }
-                            }
-                            st.running.store(false, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            stop_bridge(&st).await;
                             let cfg = { st.config.lock().await.clone() };
                             let addr = format!("{}:{}", cfg.host, cfg.port);
                             if let Err(e) = std::net::TcpListener::bind(&addr) {
@@ -827,7 +984,7 @@ pub fn run() {
                                 let _ = handle.emit("proxy-error", diag);
                                 return;
                             }
-                            spawn_bridge(handle, st, cfg);
+                            start_bridge(handle, st, cfg).await;
                         });
                     }
                     "open_logs" => {
@@ -899,7 +1056,7 @@ pub fn run() {
             get_platform,
             is_first_run,
             get_link_host,
-            get_recent_logs,
+            get_log_tail,
             open_log_file,
             clear_logs,
             open_url,
