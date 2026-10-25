@@ -205,7 +205,7 @@ async fn toggle_bridge_from_tile(app: AppHandle, on: bool) -> Result<(), String>
 /// side then falls back to launching MainActivity, whose startup auto-starts
 /// the bridge.
 #[cfg(target_os = "android")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy(
     _env: jni::JNIEnv,
     _class: jni::objects::JClass,
