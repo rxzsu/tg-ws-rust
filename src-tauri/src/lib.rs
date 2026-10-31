@@ -146,13 +146,15 @@ async fn current_tg_link(state: &Arc<AppState>) -> String {
 /// alive when the app is in the background. No-op on desktop.
 #[cfg(target_os = "android")]
 fn set_foreground_service(app: &AppHandle, enabled: bool) {
-    use jni::objects::JValue;
-
     let Some(window) = app.get_webview_window("main") else {
         log::warn!("Cannot toggle foreground service: no main webview");
         return;
     };
     let result = window.with_webview(move |platform_webview| {
+        // Tauri/wry pins jni 0.21 and hands this callback its types; our
+        // direct dependency is 0.22. Never name a `jni` type here — every
+        // type in this closure must infer to Tauri's (0.21) side, so the
+        // argument is built with `Into` instead of `JValue::Object`.
         platform_webview.jni_handle().exec(move |env, activity, _webview| {
             let Ok(class) = env.find_class("com/rxzsu/tg_ws_proxy/ProxyForegroundService") else {
                 log::warn!("Foreground service class not found");
@@ -163,7 +165,7 @@ fn set_foreground_service(app: &AppHandle, enabled: bool) {
                 class,
                 method,
                 "(Landroid/content/Context;)V",
-                &[JValue::Object(activity)],
+                &[activity.into()],
             ) {
                 log::warn!("Foreground service {method} failed: {e}");
             }
@@ -212,23 +214,28 @@ async fn toggle_bridge_from_tile(app: AppHandle, on: bool) -> Result<(), String>
 /// Returns false when the Rust runtime is not up (cold process); the Kotlin
 /// side then falls back to launching MainActivity, whose startup auto-starts
 /// the bridge.
+///
+/// Exported with jni 0.22's FFI-safe `EnvUnowned`; since 0.22 `jboolean`
+/// is a plain `bool`.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy(
-    _env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy<
+    'caller,
+>(
+    _env: jni::EnvUnowned<'caller>,
+    _class: jni::objects::JClass<'caller>,
     on: jni::sys::jboolean,
 ) -> jni::sys::jboolean {
     let Some(app) = APP_HANDLE.get() else {
-        return 0;
+        return false;
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = toggle_bridge_from_tile(app, on != 0).await {
+        if let Err(e) = toggle_bridge_from_tile(app, on).await {
             log::warn!("Tile toggle failed: {e}");
         }
     });
-    1
+    true
 }
 
 /// JNI query for the Android tile and the foreground service: the actual
@@ -237,18 +244,18 @@ pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy(
 /// false when the Rust runtime is not up (cold process).
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeIsRunning(
-    _env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeIsRunning<
+    'caller,
+>(
+    _env: jni::EnvUnowned<'caller>,
+    _class: jni::objects::JClass<'caller>,
 ) -> jni::sys::jboolean {
     let Some(app) = APP_HANDLE.get() else {
-        return 0;
+        return false;
     };
-    let running = app
-        .state::<Arc<AppState>>()
+    app.state::<Arc<AppState>>()
         .running
-        .load(Ordering::SeqCst);
-    if running { 1 } else { 0 }
+        .load(Ordering::SeqCst)
 }
 
 /// Spawn the proxy bridge task. The caller must hold the lifecycle lock.
