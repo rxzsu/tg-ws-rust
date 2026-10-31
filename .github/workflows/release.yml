@@ -89,7 +89,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build Tauri App & Publish Release
-        uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1 (action-v1.0.0)
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1 (action-v1.0.0)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
