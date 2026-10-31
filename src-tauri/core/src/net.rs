@@ -59,14 +59,18 @@ pub async fn bind_listener(host: &str, port: u16) -> io::Result<TcpListener> {
 
 /// Connect a TCP stream with `TCP_NODELAY` and tuned kernel buffers.
 ///
+/// Tokio's connect tries every resolved address until one succeeds, so a
+/// host that answers only on IPv6 (or only on IPv4) is still reachable —
+/// the previous first-address-only resolve picked one family and dropped
+/// the other.
+///
 /// NOTE: the connect itself must go through Tokio (`TcpStream::connect`),
 /// which drives the non-blocking handshake to completion. A raw blocking
 /// `connect()` on a non-blocking socket fails with `WOULDBLOCK` (WSA 10035
 /// on Windows). Buffer sizes are applied right after, which is equivalent
 /// for all subsequent transfers.
 pub async fn tcp_connect(host: &str, port: u16, io_buf: usize) -> io::Result<TcpStream> {
-    let addr = resolve(host, port).await?;
-    let stream = TcpStream::connect(addr).await?;
+    let stream = TcpStream::connect((host, port)).await?;
     tune_accepted(stream, io_buf)
 }
 

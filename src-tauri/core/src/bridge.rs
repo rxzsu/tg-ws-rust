@@ -46,7 +46,7 @@ pub async fn bridge_ws_reencrypt(
     label: String,
     activity: ActivityStamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut ws_reader, mut ws_writer) = ws.split();
+    let (mut ws_reader, mut ws_writer, ws_ponger) = ws.split();
     // Single allocation sized from config instead of a hardcoded 64 KB.
     let buf_size = crate::net::clamp_io_buf(opts.io_buf);
     let mut splitter = opts.splitter;
@@ -117,6 +117,17 @@ pub async fn bridge_ws_reencrypt(
         loop {
             match ws_reader.recv_into(&mut msg).await {
                 Ok(true) => {
+                    // Upstream PING: answer it and read on. Not answered,
+                    // CDN fronts tear the connection after ~100 s of
+                    // silence, killing every idle-but-healthy session.
+                    if let Some(pong_payload) = ws_reader.take_pending_pong() {
+                        if let Err(e) = ws_ponger.send_pong(&pong_payload).await {
+                            debug!("[{}] ws pong error: {:?}", label_down, e);
+                            break;
+                        }
+                        continue;
+                    }
+
                     touch(&activity_down);
                     let n = msg.len();
                     stats_down.add_down(n);

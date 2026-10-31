@@ -61,19 +61,31 @@ static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::const_new(None
 
 /// Resolve (with cache) an ECH-enabled TLS config for `domain`.
 /// `None` means "no ECH available, use the plain config".
+///
+/// The cache mutex is held only for the map lookups — never across the DoH
+/// fetch. Holding it during `fetch_ech_config` (up to ~24 s across two
+/// resolvers) serialized *every* upstream connect behind one lookup, turning
+/// the parallel transport race into a serial crawl and burning each
+/// candidate's `connect_timeout` while it waited for the lock.
 pub async fn tls_config_for(domain: &str) -> Option<EchClientConfig> {
     if !is_enabled() {
         return None;
     }
-    let mut cache_guard = CACHE.lock().await;
-    let cache = cache_guard.get_or_insert_with(HashMap::new);
-    if let Some(entry) = cache.get(domain) {
-        let ttl = if entry.config.is_some() { POSITIVE_TTL } else { NEGATIVE_TTL };
-        if entry.at.elapsed() < ttl {
-            return entry.config.clone();
+    {
+        let cache_guard = CACHE.lock().await;
+        if let Some(cache) = cache_guard.as_ref()
+            && let Some(entry) = cache.get(domain)
+        {
+            let ttl = if entry.config.is_some() { POSITIVE_TTL } else { NEGATIVE_TTL };
+            if entry.at.elapsed() < ttl {
+                return entry.config.clone();
+            }
         }
     }
 
+    // Fetch outside the lock. A thundering herd after TTL expiry may fetch
+    // the same domain twice; both insert the same answer and the cost is a
+    // duplicate DoH query, not a stall.
     let config = match fetch_ech_config(domain).await {
         Ok(list) => match build_ech_client_config(&list) {
             Ok(cfg) => Some(Arc::new(cfg)),
@@ -88,7 +100,11 @@ pub async fn tls_config_for(domain: &str) -> Option<EchClientConfig> {
         }
     };
 
-    cache.insert(domain.to_string(), CacheEntry { config: config.clone(), at: Instant::now() });
+    CACHE
+        .lock()
+        .await
+        .get_or_insert_with(HashMap::new)
+        .insert(domain.to_string(), CacheEntry { config: config.clone(), at: Instant::now() });
     config
 }
 
@@ -147,13 +163,19 @@ async fn doh_query(ip: &str, sni: &str, domain: &str) -> Result<Vec<u8>, String>
     tls.flush().await.map_err(|e| e.to_string())?;
 
     let mut resp = Vec::new();
+    // Bounded read; the body is parsed through the shared mini-HTTP parser so
+    // a chunked DoH answer (Cloudflare does this) lands in the JSON extractor
+    // decoded, not with hex sizes inline.
     tokio::time::timeout(DOH_TIMEOUT, tls.read_to_end(&mut resp))
         .await
         .map_err(|_| "read timeout".to_string())?
         .map_err(|e| e.to_string())?;
 
-    let pos = resp.windows(4).position(|w| w == b"\r\n\r\n").ok_or("bad DoH response")?;
-    let body = String::from_utf8_lossy(&resp[pos + 4..]);
+    let parsed = crate::mini_http::parse_response(&resp, 256 * 1024)?;
+    if parsed.status != 200 {
+        return Err(format!("DoH resolver returned HTTP {}", parsed.status));
+    }
+    let body = String::from_utf8_lossy(&parsed.body);
     extract_ech_param(&body)
 }
 

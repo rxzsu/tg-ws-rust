@@ -1,20 +1,20 @@
 <script setup lang="ts">
-import { invoke } from '@tauri-apps/api/core'
-import { Minus, Maximize2, X } from 'lucide-vue-next'
-import { useProxy } from '../../composables/useProxy'
+import { invoke } from "@tauri-apps/api/core";
+import { Minus, Maximize2, X } from "lucide-vue-next";
+import { useProxy } from "../../composables/useProxy";
 
-const { isRunning, appVersion } = useProxy()
+const { isRunning, appVersion } = useProxy();
 
 async function minimizeApp() {
-  await invoke('minimize_window')
+  await invoke("minimize_window");
 }
 
 async function toggleMaximizeApp() {
-  await invoke('toggle_maximize_window')
+  await invoke("toggle_maximize_window");
 }
 
 async function closeApp() {
-  await invoke('close_window')
+  await invoke("close_window");
 }
 </script>
 
@@ -25,21 +25,22 @@ async function closeApp() {
   >
     <!-- Left: version -->
     <div class="w-24 font-mono text-[11px] text-ink-3">
-      v{{ appVersion || '—' }}
+      v{{ appVersion || "—" }}
     </div>
 
     <!-- Centered title with status dot -->
-    <div
-      data-tauri-drag-region
-      class="flex items-center gap-2.5"
-    >
+    <div data-tauri-drag-region class="flex items-center gap-2.5">
       <span
         class="h-2 w-2 rounded-full transition-all duration-300"
-        :class="isRunning
-          ? 'animate-pulse bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]'
-          : 'bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.9)]'"
+        :class="
+          isRunning
+            ? 'animate-pulse bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]'
+            : 'bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.9)]'
+        "
       />
-      <span class="text-xs font-semibold tracking-[0.16em] text-white">TG WS PROXY</span>
+      <span class="text-xs font-semibold tracking-[0.16em] text-white"
+        >TG WS PROXY</span
+      >
     </div>
 
     <!-- Window controls -->

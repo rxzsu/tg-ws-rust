@@ -84,9 +84,10 @@ fn default_transport() -> String {
 
 impl Default for ProxyConfig {
     fn default() -> Self {
-        let mut dc_redirects = HashMap::new();
-        dc_redirects.insert(2, "149.154.167.220".to_string());
-        dc_redirects.insert(4, "149.154.167.220".to_string());
+        // `dc_redirects` starts empty: with no user override the engine uses
+        // the built-in per-DC table (`get_default_dc_ip`). Shipping default
+        // entries here made the UI show values that were never actually used.
+        let dc_redirects = HashMap::new();
 
         let mut rng_bytes = [0u8; 16];
         rand::RngExt::fill(&mut rand::rng(), &mut rng_bytes);
@@ -193,6 +194,9 @@ pub fn validate(cfg: &ProxyConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Built-in per-DC IPs, used when the user's `dc_redirects` has no entry
+/// for the DC (see `dc_target_ip` in the bridge). The settings field and
+/// this table now mean the same thing: the user's entry wins.
 pub fn get_default_dc_ip(dc: i32, is_test: bool) -> Option<&'static str> {
     if is_test {
         match dc {

@@ -148,7 +148,17 @@ async fn read_frame_into<R: AsyncReadExt + Unpin>(
     } else if raw_len == 127 {
         let mut b = [0u8; 8];
         read_exact_buffered(reader, leftover, &mut b).await?;
-        u64::from_be_bytes(b) as usize
+        // Check the full u64 before the cast: on a 32-bit build `as usize`
+        // silently truncates a huge declared length into a small one, and
+        // the frame parser desyncs from the stream.
+        let len_u64 = u64::from_be_bytes(b);
+        if len_u64 > MAX_MESSAGE_LEN as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket frame too large",
+            ));
+        }
+        len_u64 as usize
     } else {
         raw_len as usize
     };
@@ -198,18 +208,42 @@ pub struct RawWebSocket {
     leftover: Vec<u8>,
 }
 
+/// The write half shared between the bridge's upload task (`WsWriter`) and
+/// the pong replier (`WsPonger`). An async mutex keeps the two writers from
+/// interleaving frame bytes; the lock is uncontended except on the rare
+/// upstream ping, so the per-chunk cost on the upload path is one CAS.
+type SharedWriteHalf = Arc<tokio::sync::Mutex<WriteHalf<WsStream>>>;
+
 pub struct WsReader {
     reader: ReadHalf<WsStream>,
     closed: bool,
     frag: Vec<u8>,
     leftover: Vec<u8>,
+    /// Payload of an upstream PING awaiting our PONG. Control frames carry no
+    /// MTProto data, so the bridge forwards nothing to the client for them.
+    pending_pong: Option<Vec<u8>>,
 }
 
 pub struct WsWriter {
-    writer: WriteHalf<WsStream>,
+    writer: SharedWriteHalf,
     closed: bool,
     /// Scratch buffer for `send_batch`, reused across calls.
     batch: Vec<u8>,
+}
+
+/// Answer upstream pings from the download side. Previously a ping from the
+/// CDN front went unanswered (`recv_into` skipped control frames), and
+/// frontends tear a silent connection after ~100 s — the session died on
+/// every pause in traffic and the client had to reconnect.
+pub struct WsPonger(SharedWriteHalf);
+
+impl WsPonger {
+    pub async fn send_pong(&self, payload: &[u8]) -> std::io::Result<()> {
+        let frame = build_frame(OP_PONG, payload, true);
+        let mut writer = self.0.lock().await;
+        writer.write_all(&frame).await?;
+        writer.flush().await
+    }
 }
 
 impl RawWebSocket {
@@ -410,20 +444,23 @@ impl RawWebSocket {
         read_frame_into(&mut self.stream, &mut self.leftover, payload).await
     }
 
-    pub fn split(self) -> (WsReader, WsWriter) {
+    pub fn split(self) -> (WsReader, WsWriter, WsPonger) {
         let (reader, writer) = tokio::io::split(self.stream);
+        let writer = Arc::new(tokio::sync::Mutex::new(writer));
         (
             WsReader {
                 reader,
                 closed: false,
                 frag: Vec::new(),
                 leftover: self.leftover,
+                pending_pong: None,
             },
             WsWriter {
-                writer,
+                writer: writer.clone(),
                 closed: false,
                 batch: Vec::new(),
             },
+            WsPonger(writer),
         )
     }
 }
@@ -433,9 +470,23 @@ impl WsWriter {
         if self.closed {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "WebSocket closed"));
         }
-        let frame = build_frame(OP_BINARY, data, true);
-        self.writer.write_all(&frame).await?;
-        self.writer.flush().await
+        // Encode into the reusable scratch instead of building a fresh Vec
+        // for every frame (this is the whole-upload path when the splitter
+        // is disabled — one allocation per client read before).
+        let mut batch = std::mem::take(&mut self.batch);
+        batch.clear();
+        batch.reserve(14 + data.len());
+        encode_frame(&mut batch, OP_BINARY, data, true);
+        let res = {
+            let mut writer = self.writer.lock().await;
+            match writer.write_all(&batch).await {
+                Ok(()) => writer.flush().await,
+                Err(e) => Err(e),
+            }
+        };
+        // Keep the allocation for the next frame, even on write errors.
+        self.batch = batch;
+        res
     }
 
     pub async fn send_batch(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
@@ -450,9 +501,12 @@ impl WsWriter {
         for part in parts {
             encode_frame(&mut batch, OP_BINARY, part, true);
         }
-        let res = match self.writer.write_all(&batch).await {
-            Ok(()) => self.writer.flush().await,
-            Err(e) => Err(e),
+        let res = {
+            let mut writer = self.writer.lock().await;
+            match writer.write_all(&batch).await {
+                Ok(()) => writer.flush().await,
+                Err(e) => Err(e),
+            }
         };
         // Keep the allocation for the next batch, even on write errors.
         self.batch = batch;
@@ -465,9 +519,10 @@ impl WsWriter {
         }
         self.closed = true;
         let frame = build_frame(OP_CLOSE, &[], true);
-        let _ = self.writer.write_all(&frame).await;
-        let _ = self.writer.flush().await;
-        self.writer.shutdown().await
+        let mut writer = self.writer.lock().await;
+        let _ = writer.write_all(&frame).await;
+        let _ = writer.flush().await;
+        writer.shutdown().await
     }
 }
 
@@ -496,7 +551,15 @@ impl WsReader {
                 return Ok(false);
             }
 
-            if opcode == OP_PING || opcode == OP_PONG {
+            if opcode == OP_PING {
+                // Queue the ping for the caller: the bridge replies with a
+                // pong through the shared writer. Forwarding nothing to the
+                // client is correct — WS control frames are not MTProto data.
+                self.pending_pong = Some(std::mem::take(out));
+                continue;
+            }
+
+            if opcode == OP_PONG {
                 continue;
             }
 
@@ -526,6 +589,12 @@ impl WsReader {
 
     async fn read_frame_into(&mut self, payload: &mut Vec<u8>) -> std::io::Result<(u8, bool)> {
         read_frame_into(&mut self.reader, &mut self.leftover, payload).await
+    }
+
+    /// Payload of an upstream PING received by the last `recv_into` call, if
+    /// any. The caller must reply via [`WsPonger::send_pong`].
+    pub fn take_pending_pong(&mut self) -> Option<Vec<u8>> {
+        self.pending_pong.take()
     }
 }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use rand::prelude::IndexedRandom;
 use rand::RngExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::ClientConfig;
@@ -249,6 +249,9 @@ impl Balancer {
 
 const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on the response body of one GitHub fetch: the domain list is a few KB
+/// and the release JSON is tens of KB; anything larger is garbage.
+const GITHUB_BODY_CAP: usize = 2 * 1024 * 1024;
 
 async fn fetch_github_cf_domains() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
@@ -275,26 +278,32 @@ async fn fetch_github_cf_domains() -> Result<Vec<String>, Box<dyn std::error::Er
     tls.write_all(request.as_bytes()).await?;
     tls.flush().await?;
 
-    let mut response = Vec::new();
-    tokio::time::timeout(GITHUB_READ_TIMEOUT, tls.read_to_end(&mut response)).await??;
-
-    if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-        let body = String::from_utf8_lossy(&response[pos + 4..]);
-        let mut list = Vec::new();
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let decoded = decode_cf_domain(trimmed);
-            if !decoded.is_empty() && !list.contains(&decoded) {
-                list.push(decoded);
-            }
-        }
-        return Ok(list);
+    // Real response parsing: status check + chunked/length body decode, all
+    // bounded. Previously `read_to_end` + a split at `\r\n\r\n` fed a 403
+    // page or chunked framing hex straight into the domain parser.
+    let resp = tokio::time::timeout(
+        GITHUB_READ_TIMEOUT,
+        crate::mini_http::read_response(&mut tls, GITHUB_BODY_CAP),
+    )
+    .await
+    .map_err(|_| "GitHub domains fetch timed out".to_string())??;
+    if resp.status != 200 {
+        return Err(format!("GitHub domains fetch returned HTTP {}", resp.status).into());
     }
 
-    Err("Invalid HTTP response from GitHub".into())
+    let body = String::from_utf8_lossy(&resp.body);
+    let mut list = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let decoded = decode_cf_domain(trimmed);
+        if !decoded.is_empty() && !list.contains(&decoded) {
+            list.push(decoded);
+        }
+    }
+    Ok(list)
 }
 
 pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
@@ -322,19 +331,28 @@ pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn s
     tls.write_all(req.as_bytes()).await?;
     tls.flush().await?;
 
-    let mut resp = Vec::new();
-    tokio::time::timeout(GITHUB_READ_TIMEOUT, tls.read_to_end(&mut resp)).await??;
-
-    if let Some(pos) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
-        let body = String::from_utf8_lossy(&resp[pos + 4..]);
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").to_string();
-            let url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("https://github.com/rxzsu/tg-ws-rust/releases").to_string();
-            return Ok((tag, url));
-        }
+    // Same bounded, status-checked parsing as the domains fetch: a 403
+    // rate-limit JSON (no `tag_name`) must surface as an error, not silently
+    // look like "no updates".
+    let resp = tokio::time::timeout(
+        GITHUB_READ_TIMEOUT,
+        crate::mini_http::read_response(&mut tls, GITHUB_BODY_CAP),
+    )
+    .await
+    .map_err(|_| "GitHub release fetch timed out".to_string())??;
+    if resp.status != 200 {
+        return Err(format!("GitHub release fetch returned HTTP {}", resp.status).into());
     }
 
-    Err("Failed to parse GitHub release response".into())
+    let body = String::from_utf8_lossy(&resp.body);
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid release JSON: {e}"))?;
+    let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    if tag.is_empty() {
+        return Err("release response has no tag_name".into());
+    }
+    let url = v.get("html_url").and_then(|u| u.as_str()).unwrap_or("https://github.com/rxzsu/tg-ws-rust/releases").to_string();
+    Ok((tag, url))
 }
 
 #[cfg(test)]

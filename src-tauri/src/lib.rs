@@ -26,6 +26,12 @@ struct AppState {
     /// fixed sleep, so a fast stop→start no longer races the old bridge for
     /// the listening port.
     bridge_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Serializes whole start/stop/restart operations. The UI button, tray
+    /// menu, Android QS tile, config save and autostart can all fire
+    /// concurrently on the same tokio runtime; without this, two starts could
+    /// interleave their channel/task bookkeeping (the loser overwrote the
+    /// winner's shutdown channel, leaving stop unable to reach the bridge).
+    lifecycle: Mutex<()>,
 }
 
 /// Global handle so native callbacks that have no Tauri context (the Android
@@ -176,6 +182,8 @@ fn set_foreground_service(_app: &AppHandle, _enabled: bool) {}
 #[cfg(target_os = "android")]
 async fn toggle_bridge_from_tile(app: AppHandle, on: bool) -> Result<(), String> {
     let state = app.state::<Arc<AppState>>().inner().clone();
+    // Serialize against UI-button and autostart toggles.
+    let _lifecycle = state.lifecycle.lock().await;
     if on {
         if state.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -191,10 +199,10 @@ async fn toggle_bridge_from_tile(app: AppHandle, on: bool) -> Result<(), String>
             let _ = app.emit("proxy-error", diag.clone());
             return Err(diag);
         }
-        start_bridge(app, state, cfg).await;
+        start_bridge(app, state.clone(), cfg).await;
         Ok(())
     } else {
-        stop_bridge(&state).await;
+        stop_bridge(&app, &state).await;
         set_foreground_service(&app, false);
         Ok(())
     }
@@ -223,22 +231,48 @@ pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeToggleProxy(
     1
 }
 
-/// Spawn the proxy bridge task. The shutdown channel is created and stored
-/// *before* the task spawns, so a stop issued immediately after start always
-/// reaches the bridge (previously the channel was installed inside the task,
-/// leaving a window where stop silently did nothing).
+/// JNI query for the Android tile and the foreground service: the actual
+/// bridge state from `AppState.running`, instead of a Kotlin-side optimistic
+/// mirror that desyncs after a failed start or a process restart. Returns
+/// false when the Rust runtime is not up (cold process).
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_rxzsu_tg_ws_proxy_RustBridge_nativeIsRunning(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jboolean {
+    let Some(app) = APP_HANDLE.get() else {
+        return 0;
+    };
+    let running = app
+        .state::<Arc<AppState>>()
+        .running
+        .load(Ordering::SeqCst);
+    if running { 1 } else { 0 }
+}
+
+/// Spawn the proxy bridge task. The caller must hold the lifecycle lock.
+///
+/// The `running` flag is committed *before* the shutdown channel is stored:
+/// with the old order, a second concurrent start overwrote the first one's
+/// channel (its stop signal then went nowhere and the bridge only died via
+/// the 5s abort, without session drain). The lock in `AppState` makes the
+/// interleaving impossible; the swap is a second guard for the
+/// check-then-act in the callers.
 async fn start_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConfig) {
+    if proxy_state.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(256);
     {
         let mut tx_guard = proxy_state.shutdown_tx.lock().await;
         *tx_guard = Some(shutdown_tx);
     }
-    // Pre-flight bind already succeeded in the caller; from here on the
-    // start is committed. Swap guards against a double start.
-    if proxy_state.running.swap(true, Ordering::SeqCst) {
-        return;
-    }
     set_foreground_service(&app, true);
+    // Authoritative state for the UI: tray and Android tile can change the
+    // bridge while the window is hidden, and this must not rely on the
+    // frontend guessing.
+    let _ = app.emit("bridge-state-changed", true);
 
     let stats = proxy_state.stats.clone();
     let running = proxy_state.running.clone();
@@ -252,14 +286,18 @@ async fn start_bridge(app: AppHandle, proxy_state: Arc<AppState>, cfg: ProxyConf
         }
         running.store(false, Ordering::SeqCst);
         set_foreground_service(&app_err, false);
+        // The bridge can also exit on its own (fatal bind, task panic-free
+        // return); push the new state instead of leaving stale UI.
+        let _ = app_err.emit("bridge-state-changed", false);
     });
     *proxy_state.bridge_task.lock().await = Some(handle);
 }
 
 /// Send the shutdown signal, then wait for the bridge task to actually
 /// finish (it drains live sessions for up to ~1s) before returning. Aborts
-/// the task if it somehow outlives the grace window.
-async fn stop_bridge(proxy_state: &Arc<AppState>) {
+/// the task if it somehow outlives the grace window. The caller must hold
+/// the lifecycle lock.
+async fn stop_bridge(app: &AppHandle, proxy_state: &Arc<AppState>) {
     {
         let mut tx_guard = proxy_state.shutdown_tx.lock().await;
         if let Some(tx) = tx_guard.take() {
@@ -282,6 +320,7 @@ async fn stop_bridge(proxy_state: &Arc<AppState>) {
         }
     }
     proxy_state.stats.mark_stopped();
+    let _ = app.emit("bridge-state-changed", false);
 }
 
 #[cfg(desktop)]
@@ -331,6 +370,9 @@ async fn save_config(
 
     // Only restart a bridge that is actually running. Saving settings while
     // the proxy is stopped used to silently start it.
+    // The lifecycle lock covers the whole stop→start sequence so a concurrent
+    // start_proxy/tile-toggle cannot interleave with the restart.
+    let _lifecycle = state.lifecycle.lock().await;
     let was_running = state.running.load(Ordering::SeqCst);
     if !was_running {
         return Ok(());
@@ -340,7 +382,7 @@ async fn save_config(
     // Stop the old bridge first and *wait* for it (bounded), then verify the
     // port is actually free so the user gets a clear "port busy" diagnostic
     // instead of a silent failure inside the background task.
-    stop_bridge(&state).await;
+    stop_bridge(&app, state.inner()).await;
 
     let addr = format!("{}:{}", new_config.host, new_config.port);
     if let Err(e) = std::net::TcpListener::bind(&addr) {
@@ -381,6 +423,8 @@ async fn clear_last_error(state: State<'_, Arc<AppState>>) -> Result<(), String>
 
 #[tauri::command]
 async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    // One lifecycle operation at a time (UI button vs tile vs autostart).
+    let _lifecycle = state.lifecycle.lock().await;
     if state.running.load(Ordering::SeqCst) {
         return Ok("Already running".into());
     }
@@ -415,7 +459,8 @@ async fn start_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
 
 #[tauri::command]
 async fn stop_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    stop_bridge(state.inner()).await;
+    let _lifecycle = state.lifecycle.lock().await;
+    stop_bridge(&app, state.inner()).await;
     set_foreground_service(&app, false);
     Ok(())
 }
@@ -537,23 +582,34 @@ async fn open_url(app: AppHandle, url: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn restart_proxy(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    stop_bridge(state.inner()).await;
+    let _lifecycle = state.lifecycle.lock().await;
+    // Restart means restart: when the bridge is not running, starting it
+    // would surprise the user (and desync the UI). `save_config` already
+    // behaves this way.
+    let was_running = state.running.load(Ordering::SeqCst);
+    if was_running {
+        stop_bridge(&app, state.inner()).await;
+    }
 
     let cfg = {
         let guard = state.config.lock().await;
         guard.clone()
     };
-    let addr = format!("{}:{}", cfg.host, cfg.port);
-    if let Err(e) = std::net::TcpListener::bind(&addr) {
-        let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &cfg.host, cfg.port);
-        log::error!("Restart failed: {}", diag);
-        let _ = app.emit("proxy-error", diag.clone());
-        return Err(diag);
-    }
 
-    let proxy_state = state.inner().clone();
-    start_bridge(app, proxy_state, cfg).await;
-    Ok("Restarted".into())
+    if was_running {
+        let addr = format!("{}:{}", cfg.host, cfg.port);
+        if let Err(e) = std::net::TcpListener::bind(&addr) {
+            let diag = tg_ws_proxy_core::diagnose_bind_error(&e, &cfg.host, cfg.port);
+            log::error!("Restart failed: {}", diag);
+            let _ = app.emit("proxy-error", diag.clone());
+            return Err(diag);
+        }
+        let proxy_state = state.inner().clone();
+        start_bridge(app, proxy_state, cfg).await;
+        Ok("Restarted".into())
+    } else {
+        Ok("Not running".into())
+    }
 }
 
 #[tauri::command]
@@ -621,6 +677,9 @@ pub struct DcTestResult {
 #[tauri::command]
 async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResult>, String> {
     use tg_ws_proxy_core::raw_websocket::RawWebSocket;
+    // The webview decides the list; a buggy or hostile call must not be able
+    // to spawn thousands of concurrent TLS handshakes.
+    const MAX_CUSTOM_TEST_DOMAINS: usize = 8;
     // Telegram only serves `/apiws` for DC2/DC4. DC1/3/5 answer `302` there,
     // so probing them produced guaranteed red "timeout/error" rows that told
     // the user nothing about their network. Report them as "no WS front"
@@ -634,9 +693,9 @@ async fn test_connectivity(custom_domains: Vec<String>) -> Result<Vec<DcTestResu
         ("DC203".to_string(), "kws2.web.telegram.org".to_string(), false),
     ];
 
-    for d in custom_domains {
+    for d in custom_domains.into_iter().take(MAX_CUSTOM_TEST_DOMAINS) {
         let clean = d.trim().to_string();
-        if !clean.is_empty() {
+        if !clean.is_empty() && clean.len() <= 253 {
             targets.push(("Custom".to_string(), clean, false));
         }
     }
@@ -767,6 +826,7 @@ pub fn run() {
         stats: stats.clone(),
         shutdown_tx: Mutex::new(None),
         bridge_task: Mutex::new(None),
+        lifecycle: Mutex::new(()),
     });
 
     let builder = tauri::Builder::default()
@@ -795,6 +855,15 @@ pub fn run() {
         }));
 
     builder
+        .on_window_event(|window, event| {
+            // The window-close button is hidden, but Alt+F4 and taskbar
+            // "Close window" still arrive: they must hide to tray, not kill
+            // the process (and the proxy bridge with it).
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             if cfg!(debug_assertions) {
@@ -840,10 +909,20 @@ pub fn run() {
             let auto_state = app.state::<Arc<AppState>>().inner().clone();
             let auto_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Same lifecycle lock as every other start path.
+                let _lifecycle = auto_state.lifecycle.lock().await;
                 let cfg_snapshot = {
                     let guard = auto_state.config.lock().await;
                     guard.clone()
                 };
+                // Fail fast on a config that cannot work: the old path brought
+                // up `running=true` + the FGS notification first, so a broken
+                // config looked like a working proxy.
+                if let Err(msg) = tg_ws_proxy_core::config::validate(&cfg_snapshot) {
+                    log::error!("Auto-start refused: {}", msg);
+                    let _ = auto_handle.emit("proxy-error", msg);
+                    return;
+                }
                 let addr = format!("{}:{}", cfg_snapshot.host, cfg_snapshot.port);
                 if let Err(e) = std::net::TcpListener::bind(&addr) {
                     let diag = tg_ws_proxy_core::diagnose_bind_error(
@@ -855,7 +934,7 @@ pub fn run() {
                     let _ = auto_handle.emit("proxy-error", diag);
                     return;
                 }
-                start_bridge(auto_handle, auto_state, cfg_snapshot).await;
+                start_bridge(auto_handle, auto_state.clone(), cfg_snapshot).await;
             });
 
             // Telemetry broadcast loop. Emits every second only while the
@@ -940,7 +1019,16 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
-                        app.exit(0);
+                        // Quit means stop the bridge first: `app.exit(0)` used
+                        // to tear the process down mid-flight, killing live
+                        // sessions without their drain/WebSocket-close window.
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let st = handle.state::<Arc<AppState>>().inner().clone();
+                            let _lifecycle = st.lifecycle.lock().await;
+                            stop_bridge(&handle, &st).await;
+                            handle.exit(0);
+                        });
                     }
                     "show" => {
                         show_main_window(app);
@@ -971,7 +1059,16 @@ pub fn run() {
                         let handle = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let st = handle.state::<Arc<AppState>>().inner().clone();
-                            stop_bridge(&st).await;
+                            // Restart only what is running (matches
+                            // `restart_proxy`): a stopped bridge used to be
+                            // silently started from the tray.
+                            let _lifecycle = st.lifecycle.lock().await;
+                            let was_running = st.running.load(Ordering::SeqCst);
+                            if !was_running {
+                                let _ = handle.emit("bridge-state-changed", false);
+                                return;
+                            }
+                            stop_bridge(&handle, &st).await;
                             let cfg = { st.config.lock().await.clone() };
                             let addr = format!("{}:{}", cfg.host, cfg.port);
                             if let Err(e) = std::net::TcpListener::bind(&addr) {
@@ -984,7 +1081,7 @@ pub fn run() {
                                 let _ = handle.emit("proxy-error", diag);
                                 return;
                             }
-                            start_bridge(handle, st, cfg).await;
+                            start_bridge(handle, st.clone(), cfg).await;
                         });
                     }
                     "open_logs" => {
@@ -1066,6 +1163,19 @@ pub fn run() {
             test_connectivity,
             check_updates
         ])
-        .run(tauri::generate_context!())
-        .expect("error while building tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // OS-initiated exit (logoff, graceful taskkill): stop the bridge
+            // best-effort so sessions get their drain window. The tray "quit"
+            // path stops the bridge synchronously before calling `exit`.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let st = handle.state::<Arc<AppState>>().inner().clone();
+                    let _lifecycle = st.lifecycle.lock().await;
+                    stop_bridge(&handle, &st).await;
+                });
+            }
+        });
 }

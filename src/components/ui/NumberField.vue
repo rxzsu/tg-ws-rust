@@ -1,33 +1,39 @@
 <script setup lang="ts">
-import { ChevronUp, ChevronDown } from 'lucide-vue-next'
+import { ChevronUp, ChevronDown } from "lucide-vue-next";
 
-const props = withDefaults(defineProps<{
-  modelValue: number
-  min?: number
-  max?: number
-  step?: number
-}>(), { min: 0, max: 65535, step: 1 })
+const props = withDefaults(
+  defineProps<{
+    modelValue: number;
+    min?: number;
+    max?: number;
+    step?: number;
+  }>(),
+  { min: 0, max: 65535, step: 1 },
+);
 
 const emit = defineEmits<{
-  'update:modelValue': [number]
-}>()
+  "update:modelValue": [number];
+}>();
 
 function clamp(v: number): number {
-  if (Number.isNaN(v)) return props.min
-  return Math.min(props.max, Math.max(props.min, v))
+  if (Number.isNaN(v)) return props.min;
+  return Math.min(props.max, Math.max(props.min, v));
 }
 
 function inc() {
-  emit('update:modelValue', clamp((props.modelValue || 0) + props.step))
+  emit("update:modelValue", clamp((props.modelValue || 0) + props.step));
 }
 
 function dec() {
-  emit('update:modelValue', clamp((props.modelValue || 0) - props.step))
+  emit("update:modelValue", clamp((props.modelValue || 0) - props.step));
 }
 
 function onInput(e: Event) {
-  const v = parseFloat((e.target as HTMLInputElement).value)
-  if (!Number.isNaN(v)) emit('update:modelValue', v)
+  const v = parseFloat((e.target as HTMLInputElement).value);
+  if (Number.isNaN(v)) return;
+  // Integer, clamped: "1443.5" / "1e5" used to slip into save_config and
+  // die in serde with a cryptic "invalid args" for a u16 field.
+  emit("update:modelValue", clamp(Math.round(v)));
 }
 </script>
 
@@ -61,7 +67,9 @@ function onInput(e: Event) {
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 0.8rem;
   padding: 0.25rem 0.35rem 0.25rem 0.8rem;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 
 .num-field:focus-within {
@@ -95,7 +103,9 @@ function onInput(e: Event) {
   color: var(--color-ink-3);
   border-radius: 0.4rem;
   cursor: pointer;
-  transition: color 0.12s, background 0.12s;
+  transition:
+    color 0.12s,
+    background 0.12s;
 }
 
 .steppers button:hover {

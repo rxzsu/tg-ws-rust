@@ -1,10 +1,24 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { RefreshCw, Wifi, Zap, Scale, EyeOff, Cable, Globe, ShieldCheck, Cloud, Gauge, AppWindow } from 'lucide-vue-next'
-import SectionCard from '../components/ui/SectionCard.vue'
-import ToggleRow from '../components/ui/ToggleRow.vue'
-import NumberField from '../components/ui/NumberField.vue'
-import SelectField, { type SelectOption } from '../components/ui/SelectField.vue'
+import { computed, ref, watch } from "vue";
+import {
+  RefreshCw,
+  Wifi,
+  Zap,
+  Scale,
+  EyeOff,
+  Cable,
+  Globe,
+  ShieldCheck,
+  Cloud,
+  Gauge,
+  AppWindow,
+} from "lucide-vue-next";
+import SectionCard from "../components/ui/SectionCard.vue";
+import ToggleRow from "../components/ui/ToggleRow.vue";
+import NumberField from "../components/ui/NumberField.vue";
+import SelectField, {
+  type SelectOption,
+} from "../components/ui/SelectField.vue";
 import {
   useProxy,
   splitList,
@@ -12,10 +26,16 @@ import {
   dcRedirectsToText,
   PRESETS,
   type PresetId,
-} from '../composables/useProxy'
-import { invoke } from '@tauri-apps/api/core'
+} from "../composables/useProxy";
 // Actions live at module scope, not on the useProxy() return value.
-import { toggleAutostart, applyPreset, saveSettings, generateSecret, checkForUpdates, runConnectivityTest } from '../composables/useProxy'
+import {
+  toggleAutostart,
+  applyPreset,
+  saveSettings,
+  generateSecret,
+  checkForUpdates,
+  runConnectivityTest,
+} from "../composables/useProxy";
 
 const {
   config,
@@ -25,58 +45,111 @@ const {
   isMobile,
   isCheckingUpdate,
   isTestingConnectivity,
-} = useProxy()
+} = useProxy();
 
-const showAdvanced = ref(false)
+// Persisted: the section the user opened should survive a restart.
+const showAdvanced = ref(
+  (() => {
+    try {
+      return localStorage.getItem("ui.showAdvanced") === "1";
+    } catch {
+      return false;
+    }
+  })(),
+);
+watch(showAdvanced, (v) => {
+  try {
+    localStorage.setItem("ui.showAdvanced", v ? "1" : "0");
+  } catch {
+    /* storage unavailable: non-essential preference */
+  }
+});
 
 const transportOptions: SelectOption[] = [
   {
-    value: 'auto',
-    label: 'Авто (WS → QUIC/H3 → CF → TCP)',
-    desc: 'Пробуем цепочку сверху вниз, продолжаем до первого успеха',
+    value: "auto",
+    label: "Авто (WS → QUIC/H3 → CF → TCP)",
+    desc: "Пробуем цепочку сверху вниз, продолжаем до первого успеха",
   },
-  { value: 'ws', label: 'Только WebSocket', desc: 'Классический путь через домены Telegram CDN' },
-  { value: 'quic', label: 'QUIC в первую очередь', desc: 'Кастомный ALPN, UDP-релеи из списка' },
-  { value: 'h3', label: 'HTTP/3 в первую очередь', desc: 'POST /mtproto по QUIC — любой h3-сервер' },
-]
+  {
+    value: "ws",
+    label: "Только WebSocket",
+    desc: "Классический путь через домены Telegram CDN",
+  },
+  {
+    value: "quic",
+    label: "QUIC в первую очередь",
+    desc: "Кастомный ALPN, UDP-релеи из списка",
+  },
+  {
+    value: "h3",
+    label: "HTTP/3 в первую очередь",
+    desc: "POST /mtproto по QUIC — любой h3-сервер",
+  },
+];
 
 const transportHint = computed(
-  () => transportOptions.find((o) => o.value === config.value.transport)?.desc ?? '',
-)
+  () =>
+    transportOptions.find((o) => o.value === config.value.transport)?.desc ??
+    "",
+);
 
-// List inputs as live computed <-> config bindings
-const userDomainsInput = computed({
-  get: () => (config.value.cfproxy_user_domains ?? []).join(', '),
-  set: (v: string) => { config.value.cfproxy_user_domains = splitList(v) },
-})
+// The old computed get/set bindings round-tripped the raw text through
+// splitList/parseDcRedirects on every keystroke: typing a separator made the
+// getter return a string without it, v-model rewrote the input, and the
+// separator vanished under the user's fingers. Now the input owns the raw
+// text; the parsed values are pushed into the config as a side effect and
+// the input is never rewritten from them.
+const userDomainsText = ref("");
+const workerDomainsText = ref("");
+const quicRelaysText = ref("");
+const dcRedirectsText = ref("");
 
-const workerDomainsInput = computed({
-  get: () => (config.value.cfproxy_worker_domains ?? []).join(', '),
-  set: (v: string) => { config.value.cfproxy_worker_domains = splitList(v) },
-})
+watch(userDomainsText, (v) => {
+  config.value.cfproxy_user_domains = splitList(v);
+});
+watch(workerDomainsText, (v) => {
+  config.value.cfproxy_worker_domains = splitList(v);
+});
+watch(quicRelaysText, (v) => {
+  config.value.quic_relays = splitList(v);
+});
+watch(dcRedirectsText, (v) => {
+  config.value.dc_redirects = parseDcRedirects(v);
+});
 
-const quicRelaysInput = computed({
-  get: () => (config.value.quic_relays ?? []).join(', '),
-  set: (v: string) => { config.value.quic_relays = splitList(v) },
-})
-
-const dcRedirectsInput = computed({
-  get: () => dcRedirectsToText(config.value.dc_redirects),
-  set: (v: string) => { config.value.dc_redirects = parseDcRedirects(v) },
-})
+// Re-seed the inputs when the whole config object is replaced (initial load).
+// Property-level mutations (presets) don't touch these lists, so a plain
+// identity watch is enough.
+watch(
+  config,
+  () => {
+    userDomainsText.value = (config.value.cfproxy_user_domains ?? []).join(
+      ", ",
+    );
+    workerDomainsText.value = (config.value.cfproxy_worker_domains ?? []).join(
+      ", ",
+    );
+    quicRelaysText.value = (config.value.quic_relays ?? []).join(", ");
+    dcRedirectsText.value = dcRedirectsToText(config.value.dc_redirects);
+  },
+  { immediate: true },
+);
 
 const sections = [
-  { id: 'sec-presets', label: 'Пресеты' },
-  { id: 'sec-connection', label: 'Подключение' },
-  { id: 'sec-transport', label: 'Транспорт' },
-  { id: 'sec-masking', label: 'Маскировка' },
-  { id: 'sec-cloudflare', label: 'Cloudflare' },
-  { id: 'sec-perf', label: 'Производительность' },
-  { id: 'sec-app', label: 'Приложение' },
-]
+  { id: "sec-presets", label: "Пресеты" },
+  { id: "sec-connection", label: "Подключение" },
+  { id: "sec-transport", label: "Транспорт" },
+  { id: "sec-masking", label: "Маскировка" },
+  { id: "sec-cloudflare", label: "Cloudflare" },
+  { id: "sec-perf", label: "Производительность" },
+  { id: "sec-app", label: "Приложение" },
+];
 
 function scrollToSection(id: string) {
-  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  document
+    .getElementById(id)
+    ?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 </script>
 
@@ -109,9 +182,14 @@ function scrollToSection(id: string) {
           :class="{ active: activePreset === id }"
           @click="applyPreset(id as PresetId)"
         >
-          <component :is="p.icon" class="mb-1.5 h-4 w-4 text-[#5bc5f5] transition group-hover:scale-110" />
+          <component
+            :is="p.icon"
+            class="mb-1.5 h-4 w-4 text-[#5bc5f5] transition group-hover:scale-110"
+          />
           <div class="text-xs font-semibold text-white">{{ p.name }}</div>
-          <div class="mt-0.5 text-[10px] leading-snug text-ink-3">{{ p.desc }}</div>
+          <div class="mt-0.5 text-[10px] leading-snug text-ink-3">
+            {{ p.desc }}
+          </div>
         </button>
       </div>
     </SectionCard>
@@ -138,7 +216,11 @@ function scrollToSection(id: string) {
         <label class="field-label">Секрет (16 байт в hex)</label>
         <div class="flex gap-2">
           <input v-model="config.secret" class="input mono flex-1" />
-          <button class="btn btn-ghost" title="Сгенерировать случайный секрет" @click="generateSecret">
+          <button
+            class="btn btn-ghost"
+            title="Сгенерировать случайный секрет"
+            @click="generateSecret"
+          >
             <RefreshCw class="h-3 w-3" />
             <span>Случайный</span>
           </button>
@@ -147,8 +229,14 @@ function scrollToSection(id: string) {
 
       <div>
         <label class="field-label">Целевые IP дата-центров (DC:IP)</label>
-        <input v-model="dcRedirectsInput" placeholder="2: 149.154.167.220, 4: 149.154.167.220" class="input mono" />
-        <p class="mt-1 text-[10px] text-ink-3">Прямые IP-адреса для маршрутизации трафика к серверам Telegram</p>
+        <input
+          v-model="dcRedirectsText"
+          placeholder="2: 149.154.167.220, 4: 149.154.167.220"
+          class="input mono"
+        />
+        <p class="mt-1 text-[10px] text-ink-3">
+          Прямые IP-адреса для маршрутизации трафика к серверам Telegram
+        </p>
       </div>
 
       <ToggleRow
@@ -168,15 +256,23 @@ function scrollToSection(id: string) {
       <div>
         <label class="field-label">Режим апстрима</label>
         <SelectField v-model="config.transport" :options="transportOptions" />
-        <p class="mt-1 text-[10px] leading-relaxed text-ink-3">{{ transportHint }}</p>
+        <p class="mt-1 text-[10px] leading-relaxed text-ink-3">
+          {{ transportHint }}
+        </p>
       </div>
 
       <div v-if="config.transport !== 'ws'">
         <label class="field-label">Релеи (host:port, через запятую)</label>
-        <input v-model="quicRelaysInput" placeholder="relay.example.com:443" class="input mono" />
+        <input
+          v-model="quicRelaysText"
+          placeholder="relay.example.com:443"
+          class="input mono"
+        />
         <p class="mt-1 text-[10px] leading-relaxed text-ink-3">
-          Свои UDP-релеи. QUIC — ALPN <span class="font-mono">tg-ws-proxy-quic-v1</span>; HTTP/3 — обычный
-          <span class="font-mono">POST /mtproto</span> (подойдёт nginx, Caddy или Worker). Без релеев поведение прежнее.
+          Свои UDP-релеи. QUIC — ALPN
+          <span class="font-mono">tg-ws-proxy-quic-v1</span>; HTTP/3 — обычный
+          <span class="font-mono">POST /mtproto</span> (подойдёт nginx, Caddy
+          или Worker). Без релеев поведение прежнее.
         </p>
       </div>
     </SectionCard>
@@ -190,7 +286,11 @@ function scrollToSection(id: string) {
     >
       <div>
         <label class="field-label">SNI маскирующий домен (DPI bypass)</label>
-        <input v-model="config.fake_tls_domain" placeholder="например, cloudflare.com, yandex.ru" class="input mono" />
+        <input
+          v-model="config.fake_tls_domain"
+          placeholder="например, cloudflare.com, yandex.ru"
+          class="input mono"
+        />
       </div>
 
       <ToggleRow
@@ -234,7 +334,7 @@ function scrollToSection(id: string) {
           />
           <input
             v-if="config.cfproxy_user_domain_enabled"
-            v-model="userDomainsInput"
+            v-model="userDomainsText"
             placeholder="proxy.example.com, cdn.mysite.org"
             class="input"
           />
@@ -248,7 +348,7 @@ function scrollToSection(id: string) {
           />
           <input
             v-if="config.cfproxy_worker_enabled"
-            v-model="workerDomainsInput"
+            v-model="workerDomainsText"
             placeholder="my-worker.subdomain.workers.dev"
             class="input"
           />
@@ -278,7 +378,12 @@ function scrollToSection(id: string) {
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div>
           <label class="field-label">Буфер сокета (байт)</label>
-          <NumberField v-model="config.buffer_size" :min="4096" :max="1048576" :step="65536" />
+          <NumberField
+            v-model="config.buffer_size"
+            :min="4096"
+            :max="1048576"
+            :step="65536"
+          />
         </div>
         <div>
           <label class="field-label">Размер пула сокетов</label>
@@ -295,21 +400,35 @@ function scrollToSection(id: string) {
         @click="showAdvanced = !showAdvanced"
       >
         <span>Продвинутые</span>
-        <span>{{ showAdvanced ? '−' : '+' }}</span>
+        <span>{{ showAdvanced ? "−" : "+" }}</span>
       </button>
 
       <div v-if="showAdvanced" class="grid grid-cols-2 gap-3">
         <div>
           <label class="field-label">TTL сокета в пуле (сек)</label>
-          <NumberField v-model="config.pool_max_age_secs" :min="10" :max="3600" :step="10" />
+          <NumberField
+            v-model="config.pool_max_age_secs"
+            :min="10"
+            :max="3600"
+            :step="10"
+          />
         </div>
         <div>
           <label class="field-label">Keep-alive пула (сек, 0 — выкл)</label>
-          <NumberField v-model="config.pool_keepalive_secs" :min="0" :max="3600" :step="5" />
+          <NumberField
+            v-model="config.pool_keepalive_secs"
+            :min="0"
+            :max="3600"
+            :step="5"
+          />
         </div>
         <div>
           <label class="field-label">Таймаут апстрима (сек)</label>
-          <NumberField v-model="config.connect_timeout_secs" :min="2" :max="120" />
+          <NumberField
+            v-model="config.connect_timeout_secs"
+            :min="2"
+            :max="120"
+          />
         </div>
       </div>
 
@@ -337,9 +456,12 @@ function scrollToSection(id: string) {
 
       <div class="toggle-row">
         <div class="min-w-0 pr-3">
-          <div class="text-xs font-semibold text-ink-1">Обновления программы</div>
+          <div class="text-xs font-semibold text-ink-1">
+            Обновления программы
+          </div>
           <div class="mt-0.5 text-[11px] text-ink-2">
-            Текущая версия <span v-if="appVersion" class="font-mono">v{{ appVersion }}</span>
+            Текущая версия
+            <span v-if="appVersion" class="font-mono">v{{ appVersion }}</span>
           </div>
         </div>
         <button
@@ -347,15 +469,22 @@ function scrollToSection(id: string) {
           :disabled="isCheckingUpdate"
           @click="checkForUpdates(true)"
         >
-          <RefreshCw class="h-3.5 w-3.5 text-[#5bc5f5]" :class="isCheckingUpdate ? 'animate-spin' : ''" />
-          <span>{{ isCheckingUpdate ? 'Проверка…' : 'Проверить' }}</span>
+          <RefreshCw
+            class="h-3.5 w-3.5 text-[#5bc5f5]"
+            :class="isCheckingUpdate ? 'animate-spin' : ''"
+          />
+          <span>{{ isCheckingUpdate ? "Проверка…" : "Проверить" }}</span>
         </button>
       </div>
 
       <div class="toggle-row">
         <div class="min-w-0 pr-3">
-          <div class="text-xs font-semibold text-ink-1">Тест связности дата-центров</div>
-          <div class="mt-0.5 text-[11px] text-ink-2">Проверить WS-фронты DC2/DC4 и пользовательские домены</div>
+          <div class="text-xs font-semibold text-ink-1">
+            Тест связности дата-центров
+          </div>
+          <div class="mt-0.5 text-[11px] text-ink-2">
+            Проверить WS-фронты DC2/DC4 и пользовательские домены
+          </div>
         </div>
         <button
           class="btn btn-ghost"
@@ -363,16 +492,21 @@ function scrollToSection(id: string) {
           @click="runConnectivityTest"
         >
           <Wifi class="h-3.5 w-3.5 text-emerald-400" />
-          <span>{{ isTestingConnectivity ? 'Тестирование…' : 'Запустить' }}</span>
+          <span>{{
+            isTestingConnectivity ? "Тестирование…" : "Запустить"
+          }}</span>
         </button>
       </div>
     </SectionCard>
 
     <!-- Save bar -->
     <div class="pb-1 pt-2">
-      <div class="glass-strong flex items-center justify-between gap-4 rounded-2xl px-4 py-3">
+      <div
+        class="glass-strong flex items-center justify-between gap-4 rounded-2xl px-4 py-3"
+      >
         <p class="hidden text-[11px] leading-snug text-ink-2 sm:block">
-          Настройки сохраняются в config.json — активный мост перезапускается автоматически
+          Настройки сохраняются в config.json — активный мост перезапускается
+          автоматически
         </p>
         <button class="btn btn-primary ml-auto" @click="saveSettings">
           Сохранить настройки

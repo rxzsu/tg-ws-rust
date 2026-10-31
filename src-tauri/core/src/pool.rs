@@ -22,16 +22,27 @@ pub struct ConnectionPool {
     io_buf: usize,
     max_age: Duration,
     keepalive: Duration,
+    /// Bound on one background connect (replenish / warm-up). Without it a
+    /// blackholed IP left the task hanging on the OS SYN timeout, and a
+    /// burst of pool hits spawned several unbounded connects at once.
+    connect_timeout: Duration,
 }
 
 impl ConnectionPool {
-    pub fn new(max_per_key: usize, io_buf: usize, max_age_secs: u64, keepalive_secs: u64) -> Self {
+    pub fn new(
+        max_per_key: usize,
+        io_buf: usize,
+        max_age_secs: u64,
+        keepalive_secs: u64,
+        connect_timeout_secs: u64,
+    ) -> Self {
         Self {
             domains: Arc::new(RwLock::new(HashMap::new())),
             max_per_key,
             io_buf: crate::net::clamp_io_buf(io_buf),
             max_age: Duration::from_secs(max_age_secs.max(10)),
             keepalive: Duration::from_secs(keepalive_secs),
+            connect_timeout: Duration::from_secs(connect_timeout_secs.clamp(2, 120)),
         }
     }
 
@@ -212,10 +223,19 @@ impl ConnectionPool {
         }
         let this = self.clone();
         let io_buf = self.io_buf;
+        let connect_timeout = self.connect_timeout;
         tokio::spawn(async move {
-            match RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, io_buf).await {
-                Ok(ws) => this.put(domain, ws).await,
-                Err(e) => debug!("Pool replenish error for {}: {:?}", domain, e),
+            // Bounded like every client-facing connect: a blackholed domain
+            // must not hold a background task for the OS SYN timeout.
+            match tokio::time::timeout(
+                connect_timeout,
+                RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, io_buf),
+            )
+            .await
+            {
+                Ok(Ok(ws)) => this.put(domain, ws).await,
+                Ok(Err(e)) => debug!("Pool replenish error for {}: {:?}", domain, e),
+                Err(_) => debug!("Pool replenish timeout for {}", domain),
             }
         });
     }
@@ -230,6 +250,7 @@ impl ConnectionPool {
         let queues: Arc<RwLock<HashMap<String, DomainQueue>>> = self.domains.clone();
         let max = self.max_per_key;
         let io_buf = self.io_buf;
+        let connect_timeout = self.connect_timeout;
         tokio::spawn(async move {
             let mut targets = Vec::new();
             for dc in [2, 4] {
@@ -241,8 +262,20 @@ impl ConnectionPool {
             let per_domain = max.min(4);
             for domain_str in targets {
                 for _ in 0..per_domain {
-                    match RawWebSocket::connect_with_buf(&domain_str, &domain_str, "/apiws", secure, io_buf).await {
-                        Ok(ws) => {
+                    // Same bounded connect as the client paths and replenish.
+                    let conn = tokio::time::timeout(
+                        connect_timeout,
+                        RawWebSocket::connect_with_buf(
+                            &domain_str,
+                            &domain_str,
+                            "/apiws",
+                            secure,
+                            io_buf,
+                        ),
+                    )
+                    .await;
+                    match conn {
+                        Ok(Ok(ws)) => {
                             let q = {
                                 let mut map = match queues.write() {
                                     Ok(m) => m,
@@ -261,11 +294,15 @@ impl ConnectionPool {
                                 info!("Pre-warmed connection in pool for {}", domain_str);
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             // A failed warm-up usually means the network/DPI is
                             // blocking this DC; don't stall startup with more
                             // timeouts for the same domain.
                             tracing::debug!("Warm-up error for {}: {:?}", domain_str, e);
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::debug!("Warm-up timeout for {}", domain_str);
                             break;
                         }
                     }

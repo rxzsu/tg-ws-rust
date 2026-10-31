@@ -42,10 +42,23 @@ if ($Release) {
         }
         New-Item -ItemType Directory -Force $keyDir | Out-Null
 
-        # Random password: nothing secret is committed, and the same password is
-        # reused from keystore.properties on every later build.
+        # Random password from a real CSPRNG. `Get-Random` in Windows
+        # PowerShell 5.1 is seeded from a PRNG with ~2^31 of state, so a
+        # password for a key that must stay valid for ~27 years needs
+        # crypto-grade entropy instead.
         $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
-        $password = -join (1..40 | ForEach-Object { $alphabet[(Get-Random -Maximum $alphabet.Length)] })
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try {
+            $indexes = New-Object byte[] 40
+            $rng.GetBytes($indexes)
+            $password = -join ($indexes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+        } finally {
+            $rng.Dispose()
+        }
+
+        # Only this user may read the keystore directory (default ACLs on a
+        # shared machine leave it readable by other local processes).
+        & icacls $keyDir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
 
         & keytool -genkeypair -v `
             -keystore $keystore `

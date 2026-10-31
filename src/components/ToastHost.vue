@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { useToasts, dismissToast } from '../composables/useToast'
-import { Check, AlertCircle, Info, X } from 'lucide-vue-next'
+import { useToasts, dismissToast } from "../composables/useToast";
+import { Check, AlertCircle, Info, X } from "lucide-vue-next";
 
-const toasts = useToasts()
+const toasts = useToasts();
 </script>
 
 <template>
-  <div class="pointer-events-none fixed bottom-5 right-5 z-[60] flex flex-col items-end gap-2">
+  <div
+    aria-live="polite"
+    role="status"
+    class="pointer-events-none fixed bottom-5 right-5 z-[60] flex flex-col items-end gap-2"
+  >
     <TransitionGroup
       enter-active-class="transition duration-300 ease-out"
       enter-from-class="opacity-0 translate-y-3 scale-95"
@@ -15,12 +19,7 @@ const toasts = useToasts()
       leave-from-class="opacity-100"
       leave-to-class="opacity-0 translate-y-2 scale-95"
     >
-      <div
-        v-for="t in toasts"
-        :key="t.id"
-        class="toast-pill"
-        :class="t.kind"
-      >
+      <div v-for="t in toasts" :key="t.id" class="toast-pill" :class="t.kind">
         <span
           class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full"
           :class="{

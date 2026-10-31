@@ -1,23 +1,53 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, type Component } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { Download, LayoutDashboard, Settings2, ScrollText, LifeBuoy, Wifi } from 'lucide-vue-next'
-import TitleBar from './components/layout/TitleBar.vue'
-import SideNav from './components/layout/SideNav.vue'
-import ToastHost from './components/ToastHost.vue'
-import DcTestModal from './components/DcTestModal.vue'
-import OnboardingWizard from './components/OnboardingWizard.vue'
-import DashboardView from './views/DashboardView.vue'
-import SettingsView from './views/SettingsView.vue'
-import LogsView from './views/LogsView.vue'
-import GuidesView from './views/GuidesView.vue'
-import { useProxy, initProxy, runConnectivityTest, type TabId } from './composables/useProxy'
-import { pushToast } from './composables/useToast'
+import { ref, watch, onMounted, onUnmounted, type Component } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import {
+  Download,
+  LayoutDashboard,
+  Settings2,
+  ScrollText,
+  LifeBuoy,
+  Wifi,
+} from "lucide-vue-next";
+import TitleBar from "./components/layout/TitleBar.vue";
+import SideNav from "./components/layout/SideNav.vue";
+import ToastHost from "./components/ToastHost.vue";
+import DcTestModal from "./components/DcTestModal.vue";
+import OnboardingWizard from "./components/OnboardingWizard.vue";
+import DashboardView from "./views/DashboardView.vue";
+import SettingsView from "./views/SettingsView.vue";
+import LogsView from "./views/LogsView.vue";
+import GuidesView from "./views/GuidesView.vue";
+import {
+  useProxy,
+  initProxy,
+  runConnectivityTest,
+  type TabId,
+} from "./composables/useProxy";
+import { pushToast } from "./composables/useToast";
+import { formatInvokeError } from "./utils/format";
 
-const activeTab = ref<TabId>('main')
-const showWizard = ref(false)
-const sidebarCollapsed = ref(false)
+const activeTab = ref<TabId>("main");
+const showWizard = ref(false);
+
+// UI state survives restarts instead of resetting the sidebar every launch.
+function persistedBool(key: string, fallback: boolean): boolean {
+  try {
+    const stored = localStorage.getItem(key);
+    return stored === null ? fallback : stored === "1";
+  } catch {
+    return fallback;
+  }
+}
+const sidebarCollapsed = ref(persistedBool("ui.sidebarCollapsed", false));
+watch(sidebarCollapsed, (v) => {
+  try {
+    localStorage.setItem("ui.sidebarCollapsed", v ? "1" : "0");
+  } catch {
+    /* storage unavailable: non-essential preference */
+  }
+});
 
 const {
   isRunning,
@@ -26,60 +56,70 @@ const {
   isTestingConnectivity,
   testResults,
   showTestModal,
-} = useProxy()
+} = useProxy();
 
 // Unlisten functions: without calling them on unmount, every HMR pass (and
 // any future remount) stacks another copy of these listeners.
-const unlisteners: Array<() => void> = []
+const unlisteners: Array<() => void> = [];
 
 onMounted(async () => {
-  const firstRun = await initProxy()
-  showWizard.value = firstRun
+  const firstRun = await initProxy();
+  showWizard.value = firstRun;
 
   unlisteners.push(
-    await listen<string>('proxy-error', (event) => {
-      console.error('Proxy error:', event.payload)
-      isRunning.value = false
-      pushToast(event.payload, 'error', 7000)
+    await listen<string>("proxy-error", (event) => {
+      console.error("Proxy error:", event.payload);
+      isRunning.value = false;
+      pushToast(event.payload, "error", 7000);
     }),
-  )
+  );
   unlisteners.push(
-    await listen('open-settings', () => {
-      activeTab.value = 'settings'
+    await listen("open-settings", () => {
+      activeTab.value = "settings";
     }),
-  )
-})
+  );
+});
 
 onUnmounted(() => {
-  for (const unlisten of unlisteners.splice(0)) unlisten()
-})
+  for (const unlisten of unlisteners.splice(0)) unlisten();
+});
 
 const views: Record<TabId, Component> = {
   main: DashboardView,
   settings: SettingsView,
   logs: LogsView,
   help: GuidesView,
-}
+};
 
 const mobileItems: Array<{ id: TabId; label: string; icon: Component }> = [
-  { id: 'main', label: 'Мост', icon: LayoutDashboard },
-  { id: 'settings', label: 'Настройки', icon: Settings2 },
-  { id: 'logs', label: 'Логи', icon: ScrollText },
-  { id: 'help', label: 'Помощь', icon: LifeBuoy },
-]
+  { id: "main", label: "Мост", icon: LayoutDashboard },
+  { id: "settings", label: "Настройки", icon: Settings2 },
+  { id: "logs", label: "Логи", icon: ScrollText },
+  { id: "help", label: "Помощь", icon: LifeBuoy },
+];
 
 async function openRelease() {
-  if (updateInfo.value) {
-    await invoke('open_url', { url: updateInfo.value.release_url })
+  if (!updateInfo.value) return;
+  try {
+    await invoke("open_url", { url: updateInfo.value.release_url });
+  } catch (e) {
+    console.error("Failed to open release page:", e);
+    pushToast(formatInvokeError(e), "error");
   }
 }
 </script>
 
 <template>
-  <div class="app-shell flex h-screen flex-col overflow-hidden" :class="{ 'is-mobile': isMobile }">
+  <div
+    class="app-shell flex h-screen flex-col overflow-hidden"
+    :class="{ 'is-mobile': isMobile }"
+  >
     <TitleBar v-if="!isMobile" />
 
-    <div class="flex min-h-0 flex-1 gap-3 px-3 pb-3" :class="{ 'px-2 pb-2': isMobile }">
+    <div
+      class="flex min-h-0 flex-1 gap-3 px-3 pb-3"
+      :class="{ 'px-2 pb-2': isMobile }"
+    >
       <SideNav
         v-model:active="activeTab"
         v-model:collapsed="sidebarCollapsed"
@@ -116,7 +156,9 @@ async function openRelease() {
     </div>
 
     <!-- Mobile bottom navigation -->
-    <nav class="glass-strong mx-3 mb-3 flex items-center justify-around rounded-2xl px-2 py-2 md:hidden">
+    <nav
+      class="glass-strong mx-3 mb-3 flex items-center justify-around rounded-2xl px-2 py-2 md:hidden"
+    >
       <button
         v-for="item in mobileItems"
         :key="item.id"
@@ -132,8 +174,11 @@ async function openRelease() {
         :disabled="isTestingConnectivity"
         @click="runConnectivityTest"
       >
-        <Wifi class="h-5 w-5 text-emerald-400" :class="isTestingConnectivity ? 'animate-pulse' : ''" />
-        <span>{{ isTestingConnectivity ? 'Тест…' : 'DC' }}</span>
+        <Wifi
+          class="h-5 w-5 text-emerald-400"
+          :class="isTestingConnectivity ? 'animate-pulse' : ''"
+        />
+        <span>{{ isTestingConnectivity ? "Тест…" : "DC" }}</span>
       </button>
     </nav>
 
@@ -146,10 +191,7 @@ async function openRelease() {
       @retry="runConnectivityTest"
     />
 
-    <OnboardingWizard
-      :show="showWizard"
-      @close="showWizard = false"
-    />
+    <OnboardingWizard :show="showWizard" @close="showWizard = false" />
 
     <ToastHost />
   </div>

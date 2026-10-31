@@ -7,6 +7,13 @@ use ctr::Ctr128BE;
 
 type Aes256Ctr = Ctr128BE<Aes256>;
 
+/// Hard cap on a single claimed packet length. A real MTProto message never
+/// approaches this, so a larger declared length is malformed input: parsing
+/// disables itself (passthrough) instead of buffering gigabytes in flight —
+/// any client with the secret could otherwise request a ~2 GB packet in
+/// intermediate mode (or ~64 MB in abridged) and balloon both buffers.
+const MAX_SPLIT_PACKET_LEN: usize = 16 * 1024 * 1024;
+
 pub struct MsgSplitter {
     dec: Aes256Ctr,
     proto: u32,
@@ -79,6 +86,15 @@ impl MsgSplitter {
         // Previous call's slices are dead by contract: reclaim its prefix first.
         self.compact_if_needed();
         if self.disabled {
+            // Parsing is off: everything buffered before this call was already
+            // emitted and consumed. Clearing here keeps only the current chunk
+            // in the buffer, so every chunk is returned exactly once (the old
+            // code relied on `compact_if_needed`, which fires exactly once
+            // after the disable and then never again — `head` stays 0 — so
+            // each subsequent call re-returned the whole accumulated buffer).
+            self.cipher_buf.clear();
+            self.plain_buf.clear();
+            self.head = 0;
             self.cipher_buf.extend_from_slice(chunk);
             // Same single-slice shape as below; caller sends it as one frame.
             return vec![&self.cipher_buf[..]];
@@ -219,6 +235,11 @@ impl MsgSplitter {
             return Some(0);
         }
         let packet_len = header_len + payload_len;
+        if packet_len > MAX_SPLIT_PACKET_LEN {
+            // Malformed claim (abridged caps at ~64 MB): disable parsing
+            // (passthrough) instead of buffering the shortfall forever.
+            return Some(0);
+        }
         if avail < packet_len {
             None
         } else {
@@ -242,6 +263,11 @@ impl MsgSplitter {
             return Some(0);
         }
         let packet_len = 4 + payload_len;
+        if packet_len > MAX_SPLIT_PACKET_LEN {
+            // Malformed claim (intermediate allows ~2 GB): disable parsing
+            // instead of buffering gigabytes in cipher/plain buffers.
+            return Some(0);
+        }
         if avail < packet_len {
             None
         } else {
@@ -253,7 +279,7 @@ impl MsgSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PROTO_ABRIDGED_INT;
+    use crate::config::{PROTO_ABRIDGED_INT, PROTO_INTERMEDIATE_INT};
 
     /// Rebuild the splitter's decryption keystream (mirrors `MsgSplitter::new`)
     /// to craft valid ciphertext test vectors.
@@ -359,5 +385,43 @@ mod tests {
         assert!(sp.split(&ct[..2]).is_empty());
         let tail = sp.flush().expect("tail must be returned");
         assert_eq!(tail, ct[..2]);
+    }
+
+    /// Regression: after the splitter disables itself, every later chunk must
+    /// come through exactly once. The old disabled branch kept the previous
+    /// chunk in the buffer (compaction fires only on the first post-disable
+    /// call, then `head` stays 0), so each new call re-returned everything
+    /// accumulated before it — quadratic duplicate traffic.
+    #[test]
+    fn disabled_mode_returns_each_chunk_exactly_once() {
+        let relay_init = [0x5Au8; 64];
+        let mut enc = test_encryptor(&relay_init);
+        // A zero-length abridged packet (first byte 0x00) is malformed and
+        // switches the splitter to passthrough.
+        let ct_bad = encrypt(&mut enc, &[0x00, 0x11, 0x22, 0x33]);
+        let mut sp = MsgSplitter::new(&relay_init, PROTO_ABRIDGED_INT);
+        let first = sp.split(&ct_bad);
+        assert_eq!(join(&first), ct_bad, "the malformed chunk itself is emitted once");
+
+        let ct2 = encrypt(&mut enc, &[0x44, 0x55, 0x66]);
+        assert_eq!(join(&sp.split(&ct2)), ct2);
+        // The old bug shows on this third chunk: chunk2 was re-sent with it.
+        let ct3 = encrypt(&mut enc, &[0x77, 0x88]);
+        assert_eq!(join(&sp.split(&ct3)), ct3);
+    }
+
+    /// Regression: a packet-length claim beyond the cap must disable parsing
+    /// instead of buffering the shortfall (remote-memory-exhaustion vector).
+    #[test]
+    fn oversized_packet_claim_disables_parsing() {
+        let relay_init = [0x66u8; 64];
+        let mut enc = test_encryptor(&relay_init);
+        let mut sp = MsgSplitter::new(&relay_init, PROTO_INTERMEDIATE_INT);
+        // Intermediate header claiming just over the cap (~2 GB allowed raw).
+        let mut plain = ((16 * 1024 * 1024 + 1) as u32).to_le_bytes().to_vec();
+        plain.extend_from_slice(&[0xAA; 32]);
+        let ct = encrypt(&mut enc, &plain);
+        // Passed through as a single frame instead of waiting for ~2 GB.
+        assert_eq!(join(&sp.split(&ct)), ct);
     }
 }

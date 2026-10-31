@@ -6,8 +6,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "bun check && vite build",
+    "preview": "vite preview",
+    "check": "bun check",
+    "fmt": "bun fmt src vite.config.ts index.html",
+    "fmt:check": "bun fmt --check src vite.config.ts index.html",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@paper-design/shaders": "^0.0.82",

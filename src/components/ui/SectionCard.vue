@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import type { Component } from 'vue'
+import type { Component } from "vue";
 
 defineProps<{
-  title: string
-  subtitle?: string
-  icon?: Component
-}>()
+  title: string;
+  subtitle?: string;
+  icon?: Component;
+}>();
 </script>
 
 <template>
@@ -16,7 +16,12 @@ defineProps<{
       </div>
       <div class="min-w-0">
         <h3 class="text-sm font-bold text-white">{{ title }}</h3>
-        <p v-if="subtitle" class="mt-0.5 text-[11px] leading-relaxed text-ink-2">{{ subtitle }}</p>
+        <p
+          v-if="subtitle"
+          class="mt-0.5 text-[11px] leading-relaxed text-ink-2"
+        >
+          {{ subtitle }}
+        </p>
       </div>
       <div class="ml-auto shrink-0">
         <slot name="actions" />

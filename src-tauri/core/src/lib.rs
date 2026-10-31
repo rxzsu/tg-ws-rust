@@ -8,6 +8,7 @@ pub mod fake_tls;
 pub mod h3;
 pub mod handshake;
 pub mod logging;
+pub mod mini_http;
 pub mod net;
 pub mod pool;
 pub mod quic;
@@ -19,11 +20,11 @@ pub mod version;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::balancer::Balancer;
 use crate::bridge::{bridge_tcp_fallback, bridge_ws_reencrypt, BridgeOptions, RemoteIo};
-use crate::config::{get_default_dc_ip, ProxyConfig};
+use crate::config::ProxyConfig;
 use crate::crypto::CryptoCtx;
 use crate::fake_tls::{
     build_server_hello, proxy_to_masking_domain, verify_client_hello, ClientReader, ClientWriter,
@@ -47,6 +48,18 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// Millis of the last observed session activity (epoch), updated on every
 /// read in both bridge directions. Drives the idle watchdog cheaply.
 use crate::bridge::ActivityStamp;
+
+/// RAII: decrements `connections_active` when the session task ends — however
+/// it ends. A bare `dec_active()` at the end of the task was skipped when the
+/// JoinSet aborted the task during shutdown (or on panic), so the dashboard
+/// kept showing phantom connections after every stop with live traffic.
+struct ActiveGuard(Arc<Stats>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.dec_active();
+    }
+}
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -104,6 +117,19 @@ pub fn diagnose_bind_error(err: &std::io::Error, host: &str, port: u16) -> Strin
     }
 }
 
+/// Upstream IP for a DC: a user-configured `dc_redirects` entry wins,
+/// otherwise the built-in table. The settings field used to be validated
+/// and shown in the UI but silently ignored by the engine.
+fn dc_target_ip(cfg: &ProxyConfig, dc: i32, is_test: bool) -> Option<String> {
+    if let Some(ip) = cfg.dc_redirects.get(&crate::config::normalize_dc(dc)) {
+        let ip = ip.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    crate::config::get_default_dc_ip(dc, is_test).map(str::to_string)
+}
+
 pub async fn run_server_with_stats(
     config: ProxyConfig,
     stats: Arc<Stats>,
@@ -144,6 +170,7 @@ pub async fn run_server_with_stats(
         crate::net::clamp_io_buf(cfg.buffer_size),
         cfg.pool_max_age_secs,
         cfg.pool_keepalive_secs,
+        cfg.connect_timeout_secs,
     ));
     pool.clone().start_cleanup_task();
     pool.clone().start_keepalive_task();
@@ -158,14 +185,41 @@ pub async fn run_server_with_stats(
     // dropping the handler futures mid-write (which used to cut the last
     // packet and skip the WebSocket close frame).
     let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Consecutive accept failures; drives the backoff below and resets on any
+    // successful accept.
+    let mut accept_strikes: u32 = 0;
 
     loop {
         let (stream, peer_addr) = tokio::select! {
             res = listener.accept() => {
                 match res {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        accept_strikes = 0;
+                        r
+                    }
                     Err(e) => {
-                        error!("Accept error: {:?}", e);
+                        accept_strikes += 1;
+                        // Per-connection resets arrive in bursts on Windows
+                        // (WSAECONNRESET while the port is being scanned);
+                        // they are noise, not a server fault. Persistent
+                        // storms must not busy-loop the acceptor with an
+                        // error!-level log (metadata + fsync) per iteration.
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                        ) {
+                            tracing::debug!("Accept error (transient): {:?}", e);
+                        } else {
+                            error!("Accept error: {:?}", e);
+                        }
+                        if accept_strikes > 1 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                (u64::from(accept_strikes) * 50).min(500),
+                            ))
+                            .await;
+                        }
                         continue;
                     }
                 }
@@ -199,7 +253,9 @@ pub async fn run_server_with_stats(
 
         sessions.spawn(async move {
             stats.inc_total();
-            stats.inc_active();
+            // Guard instead of a trailing dec_active(): aborting the task
+            // during drain (or a panic) drops the future and still decrements.
+            let _active = ActiveGuard(stats.clone());
             let label = peer_addr.to_string();
 
             let activity: ActivityStamp = Arc::new(std::sync::atomic::AtomicU64::new(now_millis()));
@@ -251,7 +307,6 @@ pub async fn run_server_with_stats(
                     }
                 }
             }
-            stats.dec_active();
         });
     }
 
@@ -377,8 +432,11 @@ async fn handle_connection(
             };
 
             let sh = build_server_hello(&secret, &tls_res.client_random, &tls_res.session_id);
-            tokio::io::AsyncWriteExt::write_all(&mut stream, &sh).await?;
-            tokio::io::AsyncWriteExt::flush(&mut stream).await?;
+            // Bounded like every other pre-bridge exchange: a client that
+            // never reads (zero window) must not pin the task until the
+            // 15-minute idle watchdog fires.
+            bounded_io(tokio::io::AsyncWriteExt::write_all(&mut stream, &sh)).await?;
+            bounded_io(tokio::io::AsyncWriteExt::flush(&mut stream)).await?;
 
             let (cr, cw) = stream.into_split();
             let mut clt_r = ClientReader::FakeTls(FakeTlsReader::new(cr));
@@ -508,13 +566,28 @@ async fn handle_connection(
         }
 
         let mut winner: Option<(String, RawWebSocket)> = None;
-        while let Some(joined) = set.join_next().await {
+        // Sockets whose handshake had already completed when another
+        // candidate won: pushing them into the pool instead of dropping
+        // recycles a full TCP+TLS+WS handshake for the next client.
+        let mut surplus: Vec<(String, RawWebSocket)> = Vec::new();
+        loop {
+            // As soon as a winner exists, cancel the in-flight candidates:
+            // waiting for them would burn a full connect timeout each.
+            // Tasks that had already finished still report their outcome
+            // (runner-up sockets land in the pool below).
+            if winner.is_some() {
+                set.abort_all();
+            }
+            let Some(joined) = set.join_next().await else { break };
             let Ok((domain, res)) = joined else { continue };
             match res {
                 Some(Ok(socket)) => {
-                    info!("[{}] Race winner: upstream WS {}", label, domain);
-                    winner = Some((domain, socket));
-                    break;
+                    if winner.is_none() {
+                        info!("[{}] Race winner: upstream WS {}", label, domain);
+                        winner = Some((domain, socket));
+                    } else {
+                        surplus.push((domain, socket));
+                    }
                 }
                 Some(Err(e)) => {
                     warn!("[{}] Race: connection to {} failed: {:?}", label, domain, e);
@@ -528,10 +601,10 @@ async fn handle_connection(
                 }
             }
         }
-        // Losers still connecting are cancelled; sockets whose handshake had
-        // already completed are simply dropped (TCP close), the same as a
-        // failed attempt.
-        set.abort_all();
+        for (domain, socket) in surplus {
+            debug!("[{}] Race runner-up ready, pooled: {}", label, domain);
+            pool.put(domain, socket).await;
+        }
 
         if let Some((domain, mut socket)) = winner {
             let attempt_start = std::time::Instant::now();
@@ -676,11 +749,25 @@ async fn handle_connection(
     if ws.is_none() && cfg.fallback_cfproxy {
         // Same bounded-attempt window the direct path above uses.
         let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        let fallback_ip = get_default_dc_ip(dc_id, is_test);
+        let fallback_ip = dc_target_ip(&cfg, dc_id, is_test);
+
+        // The per-source toggles gate their lists: the UI hides the input
+        // when a source is off, and the engine used to happily keep using
+        // domains saved under a since-disabled toggle.
+        let worker_domains: &[String] = if cfg.cfproxy_worker_enabled {
+            &cfg.cfproxy_worker_domains
+        } else {
+            &[]
+        };
+        let user_domains: &[String] = if cfg.cfproxy_user_domain_enabled {
+            &cfg.cfproxy_user_domains
+        } else {
+            &[]
+        };
 
         // Try CF Worker domains
         if let Some(ip) = fallback_ip {
-            for worker_domain in &cfg.cfproxy_worker_domains {
+            for worker_domain in worker_domains {
                 let media_flag = if hs.is_media { 1 } else { 0 };
                 let path = format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, media_flag);
                 info!("[{}] Fallback CF Worker: {} -> {}", label, worker_domain, path);
@@ -699,7 +786,7 @@ async fn handle_connection(
 
         // Try User CF domains
         if ws.is_none() {
-            for cf_domain in &cfg.cfproxy_user_domains {
+            for cf_domain in user_domains {
                 info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
                 let conn = match tokio::time::timeout(ct, RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf)).await {
                     Ok(r) => r,
@@ -748,7 +835,7 @@ async fn handle_connection(
 
     // 3. Direct TCP Fallback to Telegram DC IP if all WebSockets failed
     if ws.is_none()
-        && let Some(target_ip) = get_default_dc_ip(dc_id, is_test)
+        && let Some(target_ip) = dc_target_ip(&cfg, dc_id, is_test)
     {
         info!("[{}] All WebSockets failed, engaging Direct TCP Fallback to {}:443", label, target_ip);
         // A blackholed IP never answers, so waiting the full connect timeout
@@ -759,7 +846,7 @@ async fn handle_connection(
         );
         let tcp_conn = tokio::time::timeout(
             probe_timeout,
-            crate::net::tcp_connect(target_ip, 443, io_buf)
+            crate::net::tcp_connect(&target_ip, 443, io_buf)
         ).await;
 
         if let Ok(Ok(mut remote_stream)) = tcp_conn {
@@ -790,7 +877,7 @@ async fn handle_connection(
                      блокируется провайдером. Файлы и медиа с этой DC не загрузятся — \
                      добавьте релей (домен на Cloudflare, Worker или QUIC/H3) или другой канал связи",
                     dc_id,
-                    get_default_dc_ip(dc_id, is_test).unwrap_or("DC-IP")
+                    dc_target_ip(&cfg, dc_id, is_test).unwrap_or_else(|| "DC-IP".into())
                 )
             } else {
                 format!("все апстримы для DC{} (WS, CF, TCP) недоступны", dc_id)
@@ -819,6 +906,53 @@ async fn handle_connection(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod dc_target_ip_tests {
+    use super::dc_target_ip;
+    use crate::config::ProxyConfig;
+
+    /// The user's `dc_redirects` entry must win over the built-in table —
+    /// the field used to be validated and shown in the UI but ignored.
+    #[test]
+    fn user_redirect_overrides_builtin() {
+        let mut cfg = ProxyConfig::default();
+        assert_eq!(
+            dc_target_ip(&cfg, 2, false).as_deref(),
+            Some("149.154.167.51"),
+            "no entry -> built-in table"
+        );
+
+        cfg.dc_redirects.insert(2, "10.0.0.1".into());
+        assert_eq!(
+            dc_target_ip(&cfg, 2, false).as_deref(),
+            Some("10.0.0.1"),
+            "user entry wins"
+        );
+
+        // DC203 is an alias of DC2 and uses the same override.
+        assert_eq!(dc_target_ip(&cfg, 203, false).as_deref(), Some("10.0.0.1"));
+        // Other DCs are untouched.
+        assert_eq!(
+            dc_target_ip(&cfg, 4, false).as_deref(),
+            Some("149.154.167.91")
+        );
+
+        // A blank entry falls through to the built-in table.
+        cfg.dc_redirects.insert(2, "  ".into());
+        assert_eq!(
+            dc_target_ip(&cfg, 2, false).as_deref(),
+            Some("149.154.167.51")
+        );
+    }
+
+    #[test]
+    fn default_config_has_no_redirects() {
+        // Default entries would silently reroute the TCP fallback for every
+        // new install; the built-in table is the default route instead.
+        assert!(ProxyConfig::default().dc_redirects.is_empty());
+    }
 }
 
 #[cfg(test)]

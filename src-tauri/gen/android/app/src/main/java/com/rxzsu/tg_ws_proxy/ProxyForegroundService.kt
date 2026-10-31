@@ -21,12 +21,26 @@ import androidx.core.content.ContextCompat
  * to keep long-lived networking work alive.
  *
  * The service deliberately does not own the proxy itself: the Rust server runs
- * inside the Tauri process, this only pins that process.
+ * inside the Tauri process, this only pins that process. Rust is also the
+ * only one who starts/stops it (`set_foreground_service` on every bridge
+ * start/stop); Kotlin used to start it directly on tile clicks, which left
+ * an active notification behind whenever the start was rejected.
  */
 class ProxyForegroundService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    // Only show the "bridge running" notification when the bridge is
+    // actually running. A system restart of this service after process death
+    // (START_STICKY) or a stale start() call used to display an active
+    // notification inside a cold process where no bridge exists. When Rust
+    // itself starts the service, `running` is committed before the JNI call,
+    // so a legitimate start always passes this check.
+    if (!RustBridge.isRunning()) {
+      stopSelf()
+      return START_NOT_STICKY
+    }
+
     createChannel()
 
     val openApp = PendingIntent.getActivity(

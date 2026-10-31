@@ -24,6 +24,21 @@ pub struct FakeTlsHandshake {
     pub timestamp: u32,
 }
 
+/// Constant-time equality for MAC material: consumes the whole slice either
+/// way, so a timing probe cannot binary-search the expected MAC prefix
+/// byte-by-byte. (The remaining 4 bytes are XORed into the timestamp below
+/// and are not secret-compared by design.)
+fn ct_slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<FakeTlsHandshake> {
     let n = data.len();
     if n < 43 || data[0] != TLS_RECORD_HANDSHAKE || data[5] != 0x01 {
@@ -42,7 +57,7 @@ pub fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<FakeTlsHandshak
     mac.update(&zeroed);
     let expected = mac.finalize().into_bytes();
 
-    if client_random[..28] != expected[..28] {
+    if !ct_slice_eq(&client_random[..28], &expected[..28]) {
         return None;
     }
 

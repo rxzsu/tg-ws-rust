@@ -1,46 +1,48 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { DcRoute } from '../composables/useProxy'
+import { computed } from "vue";
+import type { DcRoute } from "../composables/useProxy";
 
 const props = defineProps<{
-  routes: DcRoute[]
-}>()
+  routes: DcRoute[];
+}>();
 
 /** Newest-first list from the backend; keep it compact and stable. */
-const routes = computed(() => props.routes.slice(0, 6))
+const routes = computed(() => props.routes.slice(0, 6));
 
 function tone(state: string) {
   switch (state) {
-    case 'ok':
-      return 'is-ok'
-    case 'no_front':
-      return 'is-warn'
-    case 'no_cf':
-      return 'is-warn'
+    case "ok":
+      return "is-ok";
+    case "no_front":
+      return "is-warn";
+    case "no_cf":
+      return "is-warn";
     default:
-      return 'is-fail'
+      return "is-fail";
   }
 }
 
 function label(state: string) {
   switch (state) {
-    case 'ok':
-      return 'ок'
-    case 'no_front':
-      return 'нет WS-фронта'
-    case 'no_cf':
-      return 'нет CF-маршрута'
-    case 'timeout':
-      return 'таймаут'
+    case "ok":
+      return "ок";
+    case "no_front":
+      return "нет WS-фронта";
+    case "no_cf":
+      return "нет CF-маршрута";
+    case "timeout":
+      return "таймаут";
     default:
-      return 'ошибка'
+      return "ошибка";
   }
 }
 </script>
 
 <template>
   <section v-if="routes.length" class="glass rounded-2xl px-3 py-2.5">
-    <div class="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-ink-3">
+    <div
+      class="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-ink-3"
+    >
       Маршруты DC
     </div>
     <div class="flex flex-wrap gap-1.5">

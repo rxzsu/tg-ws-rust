@@ -1,6 +1,6 @@
 # ⚡ Telegram WebSocket Proxy (Rust + Tauri v2)
 
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.95+-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-blue.svg?style=flat-square&logo=tauri)](https://tauri.app/)
 [![Vue 3](https://img.shields.io/badge/Vue-3.5-42b883.svg?style=flat-square&logo=vuedotjs)](https://vuejs.org/)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-v4-38bdf8.svg?style=flat-square&logo=tailwindcss)](https://tailwindcss.com/)
@@ -80,7 +80,7 @@ flowchart LR
 
 Требования:
 - [Bun](https://bun.sh/) (рекомендуется) или Node.js 20+
-- [Rust](https://rustup.rs/) (версия 1.85+ с поддержкой редакции 2024)
+- [Rust](https://rustup.rs/) (версия 1.95+ с поддержкой редакции 2024, см. `rust-version` в Cargo.toml)
 
 1. Клонируйте репозиторий:
    ```bash
@@ -105,7 +105,7 @@ flowchart LR
 
 ### Android
 
-Нужны Android SDK (platform 34+), NDK и JDK 17+; переменная `NDK_HOME`
+Нужны Android SDK (platform 36+), NDK и JDK 17+; переменная `NDK_HOME`
 (или `ANDROID_NDK_HOME`) должна указывать на NDK.
 
 ```bash
@@ -114,7 +114,7 @@ bunx tauri android build --apk --target aarch64
 ```
 
 APK появится в `src-tauri/gen/android/app/build/outputs/apk/`.
-Готовая CI-сборка — workflow `.github/workflows/android.yml`.
+Готовая CI-сборка — job `android-apk` в workflow `.github/workflows/check.yml`.
 
 **Фоновая работа:** при запуске моста приложение поднимает foreground service
 с постоянным уведомлением «Мост активен», чтобы Android не замораживал процесс

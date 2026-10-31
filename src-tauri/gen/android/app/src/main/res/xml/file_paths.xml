@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Narrowed to what the app actually shares: RustWebChromeClient hands
+     camera-capture temp JPEGs (getExternalFilesDir(Pictures)) to the camera
+     intent. The template defaults (external-path "." and cache-path ".")
+     exposed all of external storage and the whole cache dir to any granted
+     URI consumer. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-  <external-path name="my_images" path="." />
-  <cache-path name="my_cache_images" path="." />
+  <external-files-path name="my_images" path="Pictures/" />
 </paths>

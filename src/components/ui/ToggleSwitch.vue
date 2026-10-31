@@ -1,12 +1,12 @@
 <script setup lang="ts">
 defineProps<{
-  modelValue: boolean
-  disabled?: boolean
-}>()
+  modelValue: boolean;
+  disabled?: boolean;
+}>();
 
 const emit = defineEmits<{
-  'update:modelValue': [boolean]
-}>()
+  "update:modelValue": [boolean];
+}>();
 </script>
 
 <template>
@@ -34,7 +34,10 @@ const emit = defineEmits<{
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.1);
   cursor: pointer;
-  transition: background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
 }
 
 .switch:disabled {
