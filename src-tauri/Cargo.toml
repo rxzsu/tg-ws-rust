@@ -48,7 +48,7 @@ tauri-plugin-single-instance = "2.5.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Used to toggle the foreground service from Rust (see `set_foreground_service`).
-jni = "0.21"
+jni = "0.22"
 
 # Release tuning (this manifest is the workspace root on CI, where the
 # parent workspace below does not exist). LTO + single codegen unit for
