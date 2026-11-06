@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,11 +35,11 @@ jobs:
           workspaces: src-tauri
 
       # GUI crate links WebKit on Linux (glib-sys build script needs it).
-      - name: Install dependencies (Ubuntu only)
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-          version: 1.0
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          pkg-config --exists glib-2.0 gtk+-3.0 webkit2gtk-4.1
 
       # `core` is a workspace member, so its dev-dependencies resolve.
       # Benches stay out of the gate (long-running); verify locally with
