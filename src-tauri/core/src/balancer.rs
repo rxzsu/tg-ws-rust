@@ -129,14 +129,19 @@ impl Balancer {
 
         let mut list: Vec<String> = scored.into_iter().map(|(_, _, d)| d).collect();
 
-        // Current domain for this DC stays first: switching costs a handshake.
+        // Stickiness is only useful while the route is healthy. Never put
+        // a known-dead random startup pick ahead of a measured healthy route.
         let current = self.dc_to_domain.read().await.get(&dc).cloned();
         if let Some(c) = current {
-            if let Some(pos) = list.iter().position(|d| *d == c) {
+            let health = self.health.read().await;
+            if matches!(health.get(&c), Some(Some(_)))
+                && let Some(pos) = list.iter().position(|d| *d == c)
+            {
                 list.remove(pos);
+                list.insert(0, c);
             }
-            list.insert(0, c);
         }
+
         list
     }
 
@@ -175,9 +180,9 @@ impl Balancer {
     /// `get_domains_for_dc`.
     async fn probe_all(&self) {
         let domains = self.domains.read().await.clone();
-        let mut handles = Vec::with_capacity(domains.len());
+        let mut handles = tokio::task::JoinSet::new();
         for d in domains {
-            handles.push(tokio::spawn(async move {
+            handles.spawn(async move {
                 // Telegram exposes every DC as `kws{dc}.<domain>`. Measure the
                 // two busiest DCs and keep the best RTT as the domain score.
                 let mut best: Option<u128> = None;
@@ -196,12 +201,12 @@ impl Balancer {
                     }
                 }
                 (d, best)
-            }));
+            });
         }
 
         let mut results = HashMap::new();
-        for h in handles {
-            if let Ok((d, rtt)) = h.await {
+        while let Some(result) = handles.join_next().await {
+            if let Ok((d, rtt)) = result {
                 results.insert(d, rtt);
             }
         }
@@ -218,22 +223,23 @@ impl Balancer {
 
     /// Background loop: hourly GitHub domain refresh + health probes every
     /// 5 minutes (first probe runs shortly after startup).
-    pub fn start_background_refresh(self: Arc<Self>) {
+    pub fn start_background_refresh(self: Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::new();
         // Health probe loop.
         let probe = self.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             // Small settle delay so startup is not delayed by probes.
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             loop {
                 probe.probe_all().await;
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
             }
-        });
+        }));
         // GitHub refresh loop (built-in third-party pool only).
         if !self.builtin_enabled {
-            return;
+            return tasks;
         }
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 if let Ok(domains) = fetch_github_cf_domains().await
                     && domains.len() >= 3
@@ -243,7 +249,8 @@ impl Balancer {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
-        });
+        }));
+        tasks
     }
 }
 
@@ -358,6 +365,16 @@ pub async fn check_latest_github_release() -> Result<(String, String), Box<dyn s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dead_sticky_domain_cannot_override_health_order() {
+        let b = Balancer::new();
+        b.update_domains_list(vec!["dead.test".into(), "live.test".into()]).await;
+        b.dc_to_domain.write().await.insert(2, "dead.test".into());
+        b.record_failure("dead.test").await;
+        b.record_success("live.test", 100).await;
+        assert_eq!(b.get_domains_for_dc(2).await[0], "live.test");
+    }
 
     /// Healthy domains (fastest first) → unknown → failed.
     #[tokio::test]

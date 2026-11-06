@@ -2,7 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use crate::raw_websocket::RawWebSocket;
-use tracing::{debug, info};
+use tracing::debug;
+use tokio::{sync::Semaphore, task::JoinHandle};
 
 /// One pooled domain queue: connections plus their creation timestamps.
 type DomainQueue = Arc<Mutex<VecDeque<(RawWebSocket, Instant)>>>;
@@ -26,7 +27,10 @@ pub struct ConnectionPool {
     /// blackholed IP left the task hanging on the OS SYN timeout, and a
     /// burst of pool hits spawned several unbounded connects at once.
     connect_timeout: Duration,
+    refills: Mutex<HashMap<String, Arc<Semaphore>>>,
+    refill_tasks: Mutex<tokio::task::JoinSet<()>>,
 }
+
 
 impl ConnectionPool {
     pub fn new(
@@ -37,6 +41,8 @@ impl ConnectionPool {
         connect_timeout_secs: u64,
     ) -> Self {
         Self {
+            refills: Mutex::new(HashMap::new()),
+            refill_tasks: Mutex::new(tokio::task::JoinSet::new()),
             domains: Arc::new(RwLock::new(HashMap::new())),
             max_per_key,
             io_buf: crate::net::clamp_io_buf(io_buf),
@@ -69,7 +75,7 @@ impl ConnectionPool {
             .clone()
     }
 
-    pub fn start_cleanup_task(self: Arc<Self>) {
+    pub fn start_cleanup_task(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -98,7 +104,7 @@ impl ConnectionPool {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Background keep-alive: every 15s send a real WS ping through each
@@ -110,11 +116,11 @@ impl ConnectionPool {
     /// Sockets are rotated one at a time (`pop_front` → ping → `push_back`)
     /// instead of moving the whole queue out: a client asking for a pooled
     /// socket during this window misses at most the one being pinged.
-    pub fn start_keepalive_task(self: Arc<Self>) {
+    pub fn start_keepalive_task(self: Arc<Self>) -> Option<JoinHandle<()>> {
         if self.max_per_key == 0 || self.keepalive.is_zero() {
-            return;
+            return None;
         }
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(self.keepalive);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -157,7 +163,7 @@ impl ConnectionPool {
                     }
                 }
             }
-        });
+        }))
     }
 
     pub async fn get(&self, domain: &str) -> Option<RawWebSocket> {
@@ -165,15 +171,18 @@ impl ConnectionPool {
             return None;
         }
         let q = self.queue_for(domain);
-        let mut list = q.lock().ok()?;
-        let now = Instant::now();
-        while let Some((ws, created)) = list.pop_back() {
-            if now.duration_since(created) < self.max_age {
-                return Some(ws);
+        // Probe outside the queue lock: a write alone cannot detect an idle
+        // connection blackholed by NAT/DPI. Bound the entire checkout, even
+        // when several stale sockets are queued.
+        tokio::time::timeout(KEEPALIVE_TIMEOUT, async {
+            loop {
+                let item = q.lock().ok()?.pop_back();
+                let (mut ws, created) = item?;
+                if created.elapsed() < self.max_age && ws.ping_pong().await.is_ok() {
+                    return Some(ws);
+                }
             }
-            debug!("Pool hit expired socket for {} (>max_age), closing", domain);
-        }
-        None
+        }).await.ok().flatten()
     }
 
     pub async fn put(&self, domain: String, ws: RawWebSocket) {
@@ -199,7 +208,7 @@ impl ConnectionPool {
             // ever take — close it instead of silently leaking it to the
             // idle timeout. Closed outside the queue lock so awaiting the
             // close frame never blocks other pool users.
-            let _ = ws.close().await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), ws.close()).await;
         }
     }
 
@@ -221,10 +230,20 @@ impl ConnectionPool {
         if self.max_per_key == 0 || self.len(&domain) >= self.max_per_key {
             return;
         }
-        let this = self.clone();
+        // One refill per domain in flight; queue length alone does not count
+        // connections still handshaking, so a burst used to spawn unbounded work.
+        let gate = {
+            let mut refills = self.refills.lock().unwrap_or_else(|p| p.into_inner());
+            refills.entry(domain.clone()).or_insert_with(|| Arc::new(Semaphore::new(1))).clone()
+        };
+        let Ok(permit) = gate.try_acquire_owned() else { return; };
+        let this = Arc::downgrade(self);
         let io_buf = self.io_buf;
         let connect_timeout = self.connect_timeout;
-        tokio::spawn(async move {
+        let mut tasks = self.refill_tasks.lock().unwrap_or_else(|p| p.into_inner());
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _permit = permit;
             // Bounded like every client-facing connect: a blackholed domain
             // must not hold a background task for the OS SYN timeout.
             match tokio::time::timeout(
@@ -233,7 +252,9 @@ impl ConnectionPool {
             )
             .await
             {
-                Ok(Ok(ws)) => this.put(domain, ws).await,
+                Ok(Ok(ws)) => {
+                    if let Some(pool) = this.upgrade() { pool.put(domain, ws).await; }
+                }
                 Ok(Err(e)) => debug!("Pool replenish error for {}: {:?}", domain, e),
                 Err(_) => debug!("Pool replenish timeout for {}", domain),
             }
@@ -243,71 +264,59 @@ impl ConnectionPool {
     /// Pre-warm up to `min(pool_size, 4)` sockets per DC that actually has a
     /// WS front (DC2/DC4; DC1/3/5 answer 302 on `/apiws`, so warming them only
     /// burned timeouts). Media subdomains fall back to on-demand connect.
-    pub async fn warm_up_defaults(&self, secure: bool) {
-        if self.max_per_key == 0 {
-            return;
-        }
-        let queues: Arc<RwLock<HashMap<String, DomainQueue>>> = self.domains.clone();
-        let max = self.max_per_key;
-        let io_buf = self.io_buf;
-        let connect_timeout = self.connect_timeout;
+    pub fn warm_up_defaults(self: Arc<Self>, secure: bool) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut targets = Vec::new();
+            let mut tasks = tokio::task::JoinSet::new();
             for dc in [2, 4] {
-                targets.extend(crate::config::ws_domains(dc, false));
-            }
-            // Cap the eager warm-up: opening dozens of TLS+WS sessions at
-            // startup is slow and looks like a traffic burst. The rest of the
-            // pool fills on demand via `replenish`.
-            let per_domain = max.min(4);
-            for domain_str in targets {
-                for _ in 0..per_domain {
-                    // Same bounded connect as the client paths and replenish.
-                    let conn = tokio::time::timeout(
-                        connect_timeout,
-                        RawWebSocket::connect_with_buf(
-                            &domain_str,
-                            &domain_str,
-                            "/apiws",
-                            secure,
-                            io_buf,
-                        ),
-                    )
-                    .await;
-                    match conn {
-                        Ok(Ok(ws)) => {
-                            let q = {
-                                let mut map = match queues.write() {
-                                    Ok(m) => m,
-                                    Err(_) => break,
-                                };
-                                map.entry(domain_str.clone())
-                                    .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
-                                    .clone()
-                            };
-                            let mut list = match q.lock() {
-                                Ok(l) => l,
-                                Err(_) => break,
-                            };
-                            if list.len() < max {
-                                list.push_back((ws, Instant::now()));
-                                info!("Pre-warmed connection in pool for {}", domain_str);
+                for domain in crate::config::ws_domains(dc, false) {
+                    let pool = self.clone();
+                    tasks.spawn(async move {
+                        // Parallel across domains/DCs, conservative within one
+                        // domain so an unavailable DC cannot delay warming another.
+                        for _ in 0..pool.max_per_key.min(4) {
+                            match tokio::time::timeout(pool.connect_timeout,
+                                RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, pool.io_buf)
+                            ).await {
+                                Ok(Ok(ws)) => pool.put(domain.clone(), ws).await,
+                                _ => break,
                             }
                         }
-                        Ok(Err(e)) => {
-                            // A failed warm-up usually means the network/DPI is
-                            // blocking this DC; don't stall startup with more
-                            // timeouts for the same domain.
-                            tracing::debug!("Warm-up error for {}: {:?}", domain_str, e);
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::debug!("Warm-up timeout for {}", domain_str);
-                            break;
-                        }
-                    }
+                    });
                 }
             }
-        });
+            while tasks.join_next().await.is_some() {}
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn dead_pooled_socket_is_discarded_before_relay_init() {
+        let pool = ConnectionPool::new(2, 4096, 60, 0, 2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(tokio::net::TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let mut server = server.unwrap().0;
+        // A peer that closed its WS session can still accept a kernel write.
+        server.write_all(&[0x88, 0]).await.unwrap();
+        pool.put("test".into(), RawWebSocket::from_test_stream(client.unwrap())).await;
+        assert!(pool.get("test").await.is_none());
+        assert_eq!(pool.len("test"), 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_pool_releases_maintenance_references() {
+        let pool = Arc::new(ConnectionPool::new(2, 4096, 60, 15, 2));
+        let weak = Arc::downgrade(&pool);
+        let mut tasks = crate::upstream::BackgroundTasks(vec![pool.clone().start_cleanup_task()]);
+        tasks.0.extend(pool.clone().start_keepalive_task());
+        tokio::task::yield_now().await;
+        drop(pool);
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none(), "old bridge must not retain a pool after stop");
     }
 }

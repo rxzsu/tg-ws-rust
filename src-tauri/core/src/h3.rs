@@ -103,9 +103,10 @@ pub async fn connect_h3(
 
     // The driver owns the connection state; without polling it no request
     // or response frame moves. It ends when the connection closes.
-    tokio::spawn(async move {
+    let driver_task = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
+    let driver_guard = crate::upstream::BackgroundTasks(vec![driver_task]);
 
     let request = http::Request::builder()
         .method(http::Method::POST)
@@ -119,122 +120,52 @@ pub async fn connect_h3(
         .map_err(|_| format!("HTTP/3 request to {} timed out", relay))??;
 
     let (bridge_side, pump_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(pump(pump_side, stream));
+    tokio::spawn(async move {
+        let _driver_guard = driver_guard;
+        pump(pump_side, stream).await;
+    });
 
     let (reader, writer) = tokio::io::split(bridge_side);
     Ok(H3Upstream { reader, writer })
 }
 
-/// One step of the pump loop, produced by polling both sides together.
-enum Step {
-    /// Bytes read from the client into the shared buffer.
-    Client(usize),
-    /// Client half-closed its side.
-    ClientClosed,
-    /// Response body chunk (`None` = stream finished).
-    Relay(Option<Vec<u8>>),
-}
-
-/// Copy bytes between the duplex pipe and the HTTP/3 request/response bodies.
-///
-/// The h3 stream is a single object, so both directions are polled by one
-/// `poll_fn` — a `select!` would need two simultaneous `&mut` borrows.
-async fn pump<S>(pipe: DuplexStream, mut stream: ::h3::client::RequestStream<S, Bytes>)
-where
-    S: ::h3::quic::BidiStream<Bytes> + Send + 'static,
-{
-    use std::pin::Pin;
-    use std::task::Poll;
-    use tokio::io::{AsyncRead, ReadBuf};
-
+/// Drive upload and response parsing independently. Some relays wait for
+/// request data before sending response headers; waiting for headers before
+/// reading the duplex pipe deadlocked both sides.
+async fn pump<S>(pipe: DuplexStream, stream: ::h3::client::RequestStream<S, Bytes>)
+where S: ::h3::quic::BidiStream<Bytes> + Send + 'static {
+    use tokio::io::AsyncReadExt;
+    let (mut send, mut recv) = stream.split();
     let (mut pipe_read, mut pipe_write) = tokio::io::split(pipe);
-    let mut buf = vec![0u8; PUMP_CHUNK];
-    let mut request_open = true;
-
-    // h3 requires the response headers to be consumed before any body frame;
-    // reading data first would treat the header block as trailers and report
-    // an immediate EOF. The wait happens here (not in `connect_h3`) so a relay
-    // that answers only after seeing request data cannot deadlock us.
-    match stream.recv_response().await {
-        Ok(response) if response.status().is_success() => {}
-        Ok(response) => {
-            tracing::warn!(
-                "HTTP/3 relay responded with {} instead of 2xx",
-                response.status()
-            );
-            let _ = pipe_write.shutdown().await;
-            return;
+    let upload = async {
+        let mut buf = vec![0u8; PUMP_CHUNK];
+        loop {
+            let n = pipe_read.read(&mut buf).await.map_err(|e| e.to_string())?;
+            if n == 0 { return send.finish().await.map_err(|e| e.to_string()); }
+            send.send_data(Bytes::copy_from_slice(&buf[..n])).await.map_err(|e| e.to_string())?;
         }
-        Err(e) => {
-            tracing::warn!("HTTP/3 response headers failed: {:?}", e);
-            let _ = pipe_write.shutdown().await;
-            return;
+    };
+    let download = async {
+        let response = tokio::time::timeout(Duration::from_secs(20), recv.recv_response())
+            .await.map_err(|_| "HTTP/3 response headers timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() { return Err(format!("HTTP/3 relay returned {}", response.status())); }
+        while let Some(mut data) = recv.recv_data().await.map_err(|e| e.to_string())? {
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                pipe_write.write_all(chunk).await.map_err(|e| e.to_string())?;
+                let len = chunk.len();
+                data.advance(len);
+            }
         }
-    }
-
-    loop {
-        let step = std::future::poll_fn(|cx| {
-            // Relay -> client first: response data is usually already there.
-            match stream.poll_recv_data(cx) {
-                Poll::Ready(Ok(Some(mut chunk))) => {
-                    let mut out = Vec::with_capacity(chunk.remaining());
-                    while chunk.has_remaining() {
-                        let piece = chunk.chunk().to_vec();
-                        chunk.advance(piece.len());
-                        out.extend_from_slice(&piece);
-                    }
-                    return Poll::Ready(Step::Relay(Some(out)));
-                }
-                Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
-                    return Poll::Ready(Step::Relay(None));
-                }
-                Poll::Pending => {}
-            }
-
-            if request_open {
-                let mut read_buf = ReadBuf::new(&mut buf);
-                match Pin::new(&mut pipe_read).poll_read(cx, &mut read_buf) {
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        return Poll::Ready(if n == 0 {
-                            Step::ClientClosed
-                        } else {
-                            Step::Client(n)
-                        });
-                    }
-                    Poll::Ready(Err(_)) => return Poll::Ready(Step::ClientClosed),
-                    Poll::Pending => {}
-                }
-            }
-
-            Poll::Pending
-        })
-        .await;
-
-        match step {
-            Step::Client(n) => {
-                if stream
-                    .send_data(Bytes::copy_from_slice(&buf[..n]))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Step::ClientClosed => {
-                request_open = false;
-                let _ = stream.finish().await;
-            }
-            Step::Relay(Some(data)) => {
-                if pipe_write.write_all(&data).await.is_err() {
-                    break;
-                }
-            }
-            Step::Relay(None) => break,
-        }
-    }
-
-    let _ = pipe_write.shutdown().await;
+        pipe_write.shutdown().await.map_err(|e| e.to_string())
+    };
+    tokio::pin!(upload, download);
+    let result = tokio::select! {
+        result = &mut upload => match result { Ok(()) => download.await, error => error },
+        result = &mut download => result,
+    };
+    if let Err(error) = result { tracing::debug!("HTTP/3 pump stopped: {}", error); }
 }
 
 #[cfg(test)]
@@ -253,7 +184,12 @@ mod tests {
     /// Full roundtrip over a local HTTP/3 server: request body in, response
     /// body out, through the duplex bridge the proxy actually uses.
     #[tokio::test]
-    async fn h3_roundtrip_echoes_body() {
+    async fn h3_roundtrip_echoes_body() { h3_roundtrip(false).await; }
+
+    #[tokio::test]
+    async fn h3_relay_can_wait_for_request_body_before_headers() { h3_roundtrip(true).await; }
+
+    async fn h3_roundtrip(delayed_headers: bool) {
         crate::quic::ensure_crypto_provider();
 
         let (cert_der, key_der) = self_signed();
@@ -287,10 +223,16 @@ mod tests {
                         Err(_) => return,
                     };
                     let resp = http::Response::builder().status(200).body(()).unwrap();
-                    if stream.send_response(resp).await.is_err() {
+                    if !delayed_headers && stream.send_response(resp).await.is_err() {
                         return;
                     }
+                    let mut needs_headers = delayed_headers;
                     while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                        if needs_headers {
+                            let response = http::Response::builder().status(200).body(()).unwrap();
+                            if stream.send_response(response).await.is_err() { return; }
+                            needs_headers = false;
+                        }
                         let mut data = Vec::with_capacity(chunk.remaining());
                         while chunk.has_remaining() {
                             let piece = chunk.chunk().to_vec();

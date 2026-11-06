@@ -1,5 +1,6 @@
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -214,14 +215,44 @@ pub struct RawWebSocket {
 /// upstream ping, so the per-chunk cost on the upload path is one CAS.
 type SharedWriteHalf = Arc<tokio::sync::Mutex<WriteHalf<WsStream>>>;
 
+/// Count bytes as they arrive, not only after a complete WS frame. A
+/// multi-megabyte frame may take longer than the heartbeat grace period.
+struct ProgressReader<R> {
+    inner: R,
+    received: Arc<AtomicU64>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        let received = buf.filled().len() - before;
+        if received > 0 { this.received.fetch_add(received as u64, Ordering::Relaxed); }
+        result
+    }
+}
+
+// Odd while recv_into owns the read path, even while the bridge is writing
+// to a slow client. A changed epoch means the reader paused during a probe.
+struct ReadInProgress(Arc<AtomicU64>);
+impl Drop for ReadInProgress {
+    fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+}
+
 pub struct WsReader {
-    reader: ReadHalf<WsStream>,
+    reader: ProgressReader<ReadHalf<WsStream>>,
     closed: bool,
     frag: Vec<u8>,
     leftover: Vec<u8>,
     /// Payload of an upstream PING awaiting our PONG. Control frames carry no
     /// MTProto data, so the bridge forwards nothing to the client for them.
     pending_pong: Option<Vec<u8>>,
+    read_epoch: Arc<AtomicU64>,
 }
 
 pub struct WsWriter {
@@ -235,18 +266,51 @@ pub struct WsWriter {
 /// CDN front went unanswered (`recv_into` skipped control frames), and
 /// frontends tear a silent connection after ~100 s — the session died on
 /// every pause in traffic and the client had to reconnect.
-pub struct WsPonger(SharedWriteHalf);
+#[derive(Clone)]
+pub struct WsPonger { writer: SharedWriteHalf, received: Arc<AtomicU64>, read_epoch: Arc<AtomicU64> }
 
 impl WsPonger {
     pub async fn send_pong(&self, payload: &[u8]) -> std::io::Result<()> {
         let frame = build_frame(OP_PONG, payload, true);
-        let mut writer = self.0.lock().await;
+        let mut writer = self.writer.lock().await;
         writer.write_all(&frame).await?;
         writer.flush().await
     }
+
+    /// Never cancel a partially-read frame to poll liveness. The download
+    /// task owns reads; incoming bytes, including partial frames, prove progress.
+    pub async fn keep_alive(&self) -> io::Result<()> {
+        self.keep_alive_with(Duration::from_secs(20), Duration::from_secs(10)).await
+    }
+
+    async fn keep_alive_with(&self, interval: Duration, grace: Duration) -> io::Result<()> {
+        loop {
+            tokio::time::sleep(interval).await;
+            let before = self.received.load(Ordering::Relaxed);
+            let read_epoch = self.read_epoch.load(Ordering::Relaxed);
+            tokio::time::timeout(grace, async {
+                let mut writer = self.writer.lock().await;
+                writer.write_all(&build_frame(OP_PING, b"health", true)).await?;
+                writer.flush().await
+            }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WS ping write stalled"))??;
+            tokio::time::sleep(grace).await;
+            if self.received.load(Ordering::Relaxed) == before
+                && read_epoch % 2 == 1
+                && self.read_epoch.load(Ordering::Relaxed) == read_epoch
+            {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "WS upstream stopped responding"));
+            }
+        }
+    }
+
 }
 
 impl RawWebSocket {
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(stream: TcpStream) -> Self {
+        Self { stream: WsStream::Plain(stream), leftover: Vec::new() }
+    }
+
     pub async fn connect(
         host: &str,
         domain: &str,
@@ -422,7 +486,7 @@ impl RawWebSocket {
         loop {
             let (opcode, _) = self.read_frame(&mut payload).await?;
             match opcode {
-                OP_PONG => return Ok(()),
+                OP_PONG if payload == b"ka" => return Ok(()),
                 OP_PING => {
                     // Stay a well-behaved WS peer (rare for a bare upstream).
                     let pong = build_frame(OP_PONG, &payload, true);
@@ -447,20 +511,23 @@ impl RawWebSocket {
     pub fn split(self) -> (WsReader, WsWriter, WsPonger) {
         let (reader, writer) = tokio::io::split(self.stream);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let received = Arc::new(AtomicU64::new(0));
+        let read_epoch = Arc::new(AtomicU64::new(0));
         (
             WsReader {
-                reader,
+                reader: ProgressReader { inner: reader, received: received.clone() },
                 closed: false,
                 frag: Vec::new(),
                 leftover: self.leftover,
                 pending_pong: None,
+                read_epoch: read_epoch.clone(),
             },
             WsWriter {
                 writer: writer.clone(),
                 closed: false,
                 batch: Vec::new(),
             },
-            WsPonger(writer),
+            WsPonger { writer, received, read_epoch },
         )
     }
 }
@@ -542,6 +609,8 @@ impl WsReader {
     /// allocate a fresh `Vec` for every frame. Returns `Ok(false)` when the
     /// peer closed the stream.
     pub async fn recv_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<bool> {
+        self.read_epoch.fetch_add(1, Ordering::Relaxed);
+        let _reading = ReadInProgress(self.read_epoch.clone());
         while !self.closed {
             out.clear();
             let (opcode, fin) = self.read_frame_into(out).await?;
@@ -556,7 +625,7 @@ impl WsReader {
                 // pong through the shared writer. Forwarding nothing to the
                 // client is correct — WS control frames are not MTProto data.
                 self.pending_pong = Some(std::mem::take(out));
-                continue;
+                return Ok(true);
             }
 
             if opcode == OP_PONG {
@@ -633,4 +702,115 @@ fn encode_frame(out: &mut Vec<u8>, opcode: u8, data: &[u8], mask: bool) {
     let start = out.len();
     out.extend_from_slice(data);
     xor_mask(&mut out[start..], &mask_key);
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn downstream_backpressure_is_not_an_upstream_failure() {
+        let (ws, mut server) = pair().await;
+        let (mut reader, _writer, heartbeat) = ws.split();
+        server.write_all(&build_frame(OP_BINARY, b"data", false)).await.unwrap();
+        assert!(reader.recv_into(&mut Vec::new()).await.unwrap());
+        // recv_into is not polled while the bridge writes this frame to a
+        // slow Telegram client. PONGs may be queued but cannot yet be read.
+        assert!(tokio::time::timeout(Duration::from_millis(150), heartbeat.keep_alive_with(Duration::from_millis(10), Duration::from_millis(50))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_survives_interleaved_ping() {
+        let (ws, mut server) = pair().await;
+        let (mut reader, _writer, ponger) = ws.split();
+        let expected: Vec<u8> = (0..131072).map(|i| (i % 251) as u8).collect();
+        let mut first = build_frame(OP_BINARY, &expected[..40000], false);
+        first[0] &= 0x7f; // FIN=0: continue this message after a control frame.
+        first.extend(build_frame(OP_PING, b"mid-transfer", false));
+        first.extend(build_frame(OP_CONT, &expected[40000..], false));
+        let send = tokio::spawn(async move {
+            server.write_all(&first).await.unwrap();
+            // Keep the connection alive until the client sends its PONG.
+            let mut pong = Vec::new();
+            let (opcode, _) = read_frame_into(&mut server, &mut Vec::new(), &mut pong).await.unwrap();
+            assert_eq!(opcode, OP_PONG);
+            assert_eq!(pong, b"mid-transfer");
+        });
+        let receive = async {
+            let mut data = Vec::new();
+            assert!(reader.recv_into(&mut data).await.unwrap());
+            ponger.send_pong(&reader.take_pending_pong().unwrap()).await.unwrap();
+            assert!(reader.recv_into(&mut data).await.unwrap());
+            assert_eq!(data, expected, "fragmentation/control frames must not lose or duplicate bytes");
+        };
+        tokio::time::timeout(Duration::from_secs(3), receive).await.unwrap();
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_frame_progress_prevents_false_heartbeat_failure() {
+        let (ws, mut server) = pair().await;
+        let (mut reader, _writer, heartbeat) = ws.split();
+        // Declare a large frame; deliberately leave it incomplete while
+        // bytes keep arriving. recv_into must remain pending throughout.
+        server.write_all(&[0x82, 126, 0x10, 0]).await.unwrap();
+        let server_task = tokio::spawn(async move {
+            loop {
+                if server.write_all(&[1]).await.is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let reader_task = tokio::spawn(async move { reader.recv_into(&mut Vec::new()).await });
+        assert!(tokio::time::timeout(Duration::from_millis(150), heartbeat.keep_alive_with(Duration::from_millis(10), Duration::from_millis(50))).await.is_err());
+        assert!(!reader_task.is_finished(), "the test frame must still be incomplete");
+        reader_task.abort();
+        server_task.abort();
+    }
+
+    async fn pair() -> (RawWebSocket, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        (RawWebSocket::from_test_stream(client.unwrap()), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn upstream_ping_is_answered_without_waiting_for_data() {
+        let (ws, mut server) = pair().await;
+        let (mut reader, _writer, ponger) = ws.split();
+        server.write_all(&build_frame(OP_PING, b"idle", false)).await.unwrap();
+        let mut data = Vec::new();
+        assert!(tokio::time::timeout(Duration::from_secs(1), reader.recv_into(&mut data)).await.unwrap().unwrap());
+        assert!(data.is_empty(), "control bytes must never reach MTProto");
+        ponger.send_pong(&reader.take_pending_pong().unwrap()).await.unwrap();
+        let (opcode, _) = read_frame_into(&mut server, &mut Vec::new(), &mut data).await.unwrap();
+        assert_eq!((opcode, data.as_slice()), (OP_PONG, b"idle".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_detects_peer_that_accepts_writes_but_never_answers() {
+        let (ws, _silent_server) = pair().await;
+        let (mut reader, _writer, heartbeat) = ws.split();
+        let reader_task = tokio::spawn(async move { let _ = reader.recv_into(&mut Vec::new()).await; });
+        tokio::task::yield_now().await;
+        let error = tokio::time::timeout(Duration::from_secs(1), heartbeat.keep_alive_with(Duration::from_millis(5), Duration::from_millis(20))).await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        reader_task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_pong_keeps_heartbeat_alive() {
+        let (ws, mut server) = pair().await;
+        let (mut reader, _writer, heartbeat) = ws.split();
+        let server_task = tokio::spawn(async move {
+            let mut data = Vec::new();
+            loop {
+                let Ok((opcode, _)) = read_frame_into(&mut server, &mut Vec::new(), &mut data).await else { break; };
+                if opcode == OP_PING && server.write_all(&build_frame(OP_PONG, &data, false)).await.is_err() { break; }
+            }
+        });
+        let reader_task = tokio::spawn(async move { let _ = reader.recv_into(&mut Vec::new()).await; });
+        assert!(tokio::time::timeout(Duration::from_millis(100), heartbeat.keep_alive_with(Duration::from_millis(5), Duration::from_millis(20))).await.is_err());
+        reader_task.abort();
+        server_task.abort();
+    }
 }

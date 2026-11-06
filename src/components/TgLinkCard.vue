@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, Check, ExternalLink, QrCode, X } from "lucide-vue-next";
+import { Copy, Check, ExternalLink, QrCode } from "lucide-vue-next";
 import BaseModal from "./ui/BaseModal.vue";
 import { pushToast } from "../composables/useToast";
 

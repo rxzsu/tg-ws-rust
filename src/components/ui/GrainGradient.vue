@@ -35,6 +35,10 @@ const props = withDefaults(
 
 const host = ref<HTMLDivElement | null>(null);
 let mount: ShaderMount | null = null;
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+function syncAnimation() {
+  mount?.setSpeed(document.hidden || reducedMotion.matches ? 0 : props.speed);
+}
 
 /** hex (#rgb/#rgba/#rrggbb/#rrggbbaa) -> [r, g, b, a] in 0..1 */
 function toVec4(hex: string): [number, number, number, number] {
@@ -85,11 +89,15 @@ onMounted(() => {
     grainGradientFragmentShader,
     buildUniforms(),
     undefined,
-    props.speed,
+    document.hidden || reducedMotion.matches ? 0 : props.speed,
   );
+  document.addEventListener("visibilitychange", syncAnimation);
+  reducedMotion.addEventListener("change", syncAnimation);
 });
 
 onUnmounted(() => {
+  document.removeEventListener("visibilitychange", syncAnimation);
+  reducedMotion.removeEventListener("change", syncAnimation);
   mount?.dispose();
   mount = null;
 });
@@ -106,12 +114,7 @@ watch(
   () => mount?.setUniforms(buildUniforms()),
 );
 
-watch(
-  () => props.speed,
-  (s) => {
-    mount?.setSpeed(s);
-  },
-);
+watch(() => props.speed, syncAnimation);
 </script>
 
 <template>

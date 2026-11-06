@@ -15,12 +15,13 @@ pub mod quic;
 pub mod raw_websocket;
 pub mod splitter;
 pub mod stats;
+mod upstream;
 pub mod version;
 
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::balancer::Balancer;
 use crate::bridge::{bridge_tcp_fallback, bridge_ws_reencrypt, BridgeOptions, RemoteIo};
@@ -172,14 +173,16 @@ pub async fn run_server_with_stats(
         cfg.pool_keepalive_secs,
         cfg.connect_timeout_secs,
     ));
-    pool.clone().start_cleanup_task();
-    pool.clone().start_keepalive_task();
+    // Every bridge generation owns its maintenance tasks. Dropping this
+    // guard on stop/error/cancellation aborts them before the next restart.
+    let mut background = upstream::BackgroundTasks::default();
+    background.0.push(pool.clone().start_cleanup_task());
+    background.0.extend(pool.clone().start_keepalive_task());
     if cfg.pool_size > 0 {
-        pool.warm_up_defaults(!cfg.disable_secure).await;
+        background.0.push(pool.clone().warm_up_defaults(!cfg.disable_secure));
     }
-
     let balancer = Arc::new(Balancer::with_builtins(cfg.use_builtin_cf_domains));
-    balancer.clone().start_background_refresh();
+    background.0.extend(balancer.clone().start_background_refresh());
 
     // Active sessions are tracked so a stop can drain them instead of
     // dropping the handler futures mid-write (which used to cut the last
@@ -516,11 +519,6 @@ async fn handle_connection(
         );
     }
 
-    /// How many health-ordered domains are connected to in parallel; the
-    /// first successful handshake wins. Happy-Eyeballs for the case where
-    /// one CDN front is blocked or degraded.
-    const RACE_WIDTH: usize = 3;
-
     // Pooled sockets first: zero network cost, try every domain's queue.
     for domain in &domains {
         let attempt_start = std::time::Instant::now();
@@ -529,7 +527,8 @@ async fn handle_connection(
             // (bounded: replenish() skips when the queue is already full).
             pool.replenish(domain.clone(), !cfg.disable_secure).await;
 
-            if pooled.send(&relay_init).await.is_ok() {
+            if matches!(tokio::time::timeout(std::time::Duration::from_secs(2), pooled.send(&relay_init)).await, Ok(Ok(()))) {
+                stats.record_dc_route(dc_id, "ok", format!("WS pool {}", domain));
                 stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
                 ws = Some(pooled);
@@ -541,120 +540,18 @@ async fn handle_connection(
         }
     }
 
-    // Fresh connects: race the top candidates in parallel instead of paying
-    // a full serial timeout per dead front.
+    // Every attempt includes relay-init; a socket that only completed TLS
+    // must not win and leave the client waiting on an unbounded write.
     if ws.is_none() && !domains.is_empty() {
-        let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        let candidates = &domains[..domains.len().min(RACE_WIDTH)];
-        type ConnectResult = Result<RawWebSocket, Box<dyn std::error::Error + Send + Sync>>;
-        let mut set: tokio::task::JoinSet<(String, Option<ConnectResult>)> =
-            tokio::task::JoinSet::new();
-        for domain in candidates {
-            let domain = domain.clone();
-            let secure = !cfg.disable_secure;
-            set.spawn(async move {
-                match tokio::time::timeout(
-                    ct,
-                    RawWebSocket::connect_with_buf(&domain, &domain, "/apiws", secure, io_buf),
-                )
-                .await
-                {
-                    Ok(res) => (domain, Some(res)),
-                    Err(_) => (domain, None),
-                }
-            });
-        }
-
-        let mut winner: Option<(String, RawWebSocket)> = None;
-        // Sockets whose handshake had already completed when another
-        // candidate won: pushing them into the pool instead of dropping
-        // recycles a full TCP+TLS+WS handshake for the next client.
-        let mut surplus: Vec<(String, RawWebSocket)> = Vec::new();
-        loop {
-            // As soon as a winner exists, cancel the in-flight candidates:
-            // waiting for them would burn a full connect timeout each.
-            // Tasks that had already finished still report their outcome
-            // (runner-up sockets land in the pool below).
-            if winner.is_some() {
-                set.abort_all();
-            }
-            let Some(joined) = set.join_next().await else { break };
-            let Ok((domain, res)) = joined else { continue };
-            match res {
-                Some(Ok(socket)) => {
-                    if winner.is_none() {
-                        info!("[{}] Race winner: upstream WS {}", label, domain);
-                        winner = Some((domain, socket));
-                    } else {
-                        surplus.push((domain, socket));
-                    }
-                }
-                Some(Err(e)) => {
-                    warn!("[{}] Race: connection to {} failed: {:?}", label, domain, e);
-                    balancer.record_failure(&domain).await;
-                    stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
-                }
-                None => {
-                    warn!("[{}] Race: connection to {} timed out", label, domain);
-                    balancer.record_failure(&domain).await;
-                    stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
-                }
-            }
-        }
-        for (domain, socket) in surplus {
-            debug!("[{}] Race runner-up ready, pooled: {}", label, domain);
-            pool.put(domain, socket).await;
-        }
-
-        if let Some((domain, mut socket)) = winner {
-            let attempt_start = std::time::Instant::now();
-            if socket.send(&relay_init).await.is_ok() {
-                stats.record_dc_route(dc_id, "ok", format!("WS {}", domain));
-                stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                balancer.record_success(&domain, attempt_start.elapsed().as_micros()).await;
-                ws = Some(socket);
-            } else {
-                warn!("[{}] Race winner {} refused relay init", label, domain);
-                balancer.record_failure(&domain).await;
-            }
-        }
-
-        // Racing covered only the first RACE_WIDTH domains; fall back to a
-        // serial pass over the rest so a large domain list still gets tried.
-        if ws.is_none() && domains.len() > RACE_WIDTH {
-            for domain in &domains[RACE_WIDTH..] {
-                let attempt_start = std::time::Instant::now();
-                info!("[{}] Connecting to upstream WS {}", label, domain);
-                let conn_res = tokio::time::timeout(
-                    ct,
-                    RawWebSocket::connect_with_buf(domain, domain, "/apiws", !cfg.disable_secure, io_buf),
-                )
-                .await;
-                match conn_res {
-                    Ok(Ok(mut socket)) => {
-                        if let Err(e) = socket.send(&relay_init).await {
-                            warn!("[{}] Failed to send relay init to {}: {:?}", label, domain, e);
-                            balancer.record_failure(domain).await;
-                            continue;
-                        }
-                        stats.record_dc_route(dc_id, "ok", format!("WS {}", domain));
-                        stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        balancer.record_success(domain, attempt_start.elapsed().as_micros()).await;
-                        ws = Some(socket);
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("[{}] Connection to {} failed: {:?}", label, domain, e);
-                        balancer.record_failure(domain).await;
-                        stats.record_dc_route(dc_id, "failed", format!("WS {}: {}", domain, e));
-                    }
-                    Err(_) => {
-                        warn!("[{}] Connection to {} timed out", label, domain);
-                        balancer.record_failure(domain).await;
-                        stats.record_dc_route(dc_id, "timeout", format!("WS {}: таймаут", domain));
-                    }
-                }
-            }
+        let targets = domains.iter().map(|domain| upstream::WsTarget {
+            key: domain.clone(), host: domain.clone(), path: "/apiws".into(),
+        }).collect();
+        if let Some((host, socket)) = upstream::race_ws(
+            targets, &cfg, relay_init, balancer.clone(),
+        ).await {
+            stats.record_dc_route(dc_id, "ok", format!("WS {}", host));
+            stats.connections_ws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ws = Some(socket);
         }
     }
 
@@ -664,172 +561,71 @@ async fn handle_connection(
         balancer.rotate_domain_for_dc(dc_id).await;
     }
 
-    // 1b. Relay transports (experimental): only when relays are configured.
-    // Telegram DCs don't speak QUIC, so without user relays this step is
-    // skipped entirely (zero behavior change by default).
-    //   `quic` → custom ALPN, raw bidirectional stream
-    //   `h3`   → real HTTP/3, MTProto is the body of POST /mtproto
-    //   `auto` → try both, QUIC first
+    // Relay setup includes DNS, handshake, stream opening and relay-init
+    // under one deadline; a dead relay cannot multiply the timeout per phase.
     if ws.is_none() && !cfg.quic_relays.is_empty() {
         use tokio::io::AsyncWriteExt;
+        type Reader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+        type Writer = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
         let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        let want_quic = matches!(cfg.transport.as_str(), "auto" | "quic");
-        let want_h3 = matches!(cfg.transport.as_str(), "auto" | "h3");
-
-        if want_quic {
-            for relay in &cfg.quic_relays {
-                info!("[{}] QUIC relay: {}", label, relay);
-                match crate::quic::connect_quic(relay, ct).await {
-                    Ok(mut up) => {
-                        if up.send.write_all(&relay_init).await.is_ok() {
-                            stats
-                                .connections_quic
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            info!("[{}] QUIC relay {} connected", label, relay);
-                            return bridge_tcp_fallback(
-                                client_reader,
-                                client_writer,
-                                RemoteIo {
-                                    reader: up.recv,
-                                    writer: up.send,
-                                },
-                                ctx,
-                                stats,
-                                label,
-                                io_buf,
-                                activity,
-                            )
-                            .await;
-                        }
-                        warn!("[{}] QUIC relay {} init failed", label, relay);
-                    }
-                    Err(e) => {
-                        warn!("[{}] QUIC relay {} failed: {:?}", label, relay, e);
-                    }
-                }
-            }
+        let mut targets = Vec::new();
+        for relay in &cfg.quic_relays {
+            if matches!(cfg.transport.as_str(), "auto" | "quic") { targets.push((relay.clone(), false)); }
+            if matches!(cfg.transport.as_str(), "auto" | "h3") { targets.push((relay.clone(), true)); }
         }
-
-        if want_h3 {
-            for relay in &cfg.quic_relays {
-                info!("[{}] HTTP/3 relay: {}", label, relay);
-                match crate::h3::connect_h3(relay, ct).await {
-                    Ok(mut up) => {
-                        if up.writer.write_all(&relay_init).await.is_ok() {
-                            stats
-                                .connections_h3
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            info!("[{}] HTTP/3 relay {} connected", label, relay);
-                            return bridge_tcp_fallback(
-                                client_reader,
-                                client_writer,
-                                RemoteIo {
-                                    reader: up.reader,
-                                    writer: up.writer,
-                                },
-                                ctx,
-                                stats,
-                                label,
-                                io_buf,
-                                activity,
-                            )
-                            .await;
-                        }
-                        warn!("[{}] HTTP/3 relay {} init failed", label, relay);
-                    }
-                    Err(e) => {
-                        warn!("[{}] HTTP/3 relay {} failed: {:?}", label, relay, e);
-                    }
-                }
+        let attempts = targets.into_iter().map(|(relay, h3)| async move {
+            let result = tokio::time::timeout(ct, async {
+                let (reader, mut writer): (Reader, Writer) = if h3 {
+                    let up = crate::h3::connect_h3(&relay, ct).await?;
+                    (Box::new(up.reader), Box::new(up.writer))
+                } else {
+                    let up = crate::quic::connect_quic(&relay, ct).await?;
+                    (Box::new(up.recv), Box::new(up.send))
+                };
+                writer.write_all(&relay_init).await?;
+                writer.flush().await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((reader, writer))
+            }).await;
+            match result {
+                Ok(Ok((reader, writer))) => Some((relay, h3, RemoteIo { reader, writer })),
+                _ => None,
             }
+        });
+        if let Some((relay, h3, remote)) = upstream::race(attempts, 4, ct * 2).await {
+            let transport = if h3 { "H3" } else { "QUIC" };
+            stats.record_dc_route(dc_id, "ok", format!("{} {}", transport, relay));
+            let counter = if h3 { &stats.connections_h3 } else { &stats.connections_quic };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return bridge_tcp_fallback(client_reader, client_writer, remote, ctx, stats, label, io_buf, activity).await;
         }
     }
 
-    // 2. Fallback: CF Worker / CF Domains / Dynamic Balancer if direct WS failed
+    // Race fallback endpoints with bounded concurrency and a shared budget.
+    // Previously 20 dead CF domains could cost 20 independent timeouts.
     if ws.is_none() && cfg.fallback_cfproxy {
-        // Same bounded-attempt window the direct path above uses.
-        let ct = std::time::Duration::from_secs(cfg.connect_timeout_secs.clamp(2, 120));
-        let fallback_ip = dc_target_ip(&cfg, dc_id, is_test);
-
-        // The per-source toggles gate their lists: the UI hides the input
-        // when a source is off, and the engine used to happily keep using
-        // domains saved under a since-disabled toggle.
-        let worker_domains: &[String] = if cfg.cfproxy_worker_enabled {
-            &cfg.cfproxy_worker_domains
-        } else {
-            &[]
-        };
-        let user_domains: &[String] = if cfg.cfproxy_user_domain_enabled {
-            &cfg.cfproxy_user_domains
-        } else {
-            &[]
-        };
-
-        // Try CF Worker domains
-        if let Some(ip) = fallback_ip {
-            for worker_domain in worker_domains {
-                let media_flag = if hs.is_media { 1 } else { 0 };
-                let path = format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, media_flag);
-                info!("[{}] Fallback CF Worker: {} -> {}", label, worker_domain, path);
-                // Bounded like the direct path above: a hung handshake to one
-                // fallback domain must not stall the whole fallback chain.
-                let conn = tokio::time::timeout(ct, RawWebSocket::connect_with_buf(worker_domain, worker_domain, &path, !cfg.disable_secure, io_buf)).await;
-                if let Ok(Ok(mut worker_ws)) = conn
-                    && worker_ws.send(&relay_init).await.is_ok()
-                {
-                    stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ws = Some(worker_ws);
-                    break;
-                }
+        let mut targets = Vec::new();
+        if cfg.cfproxy_worker_enabled
+            && let Some(ip) = dc_target_ip(&cfg, dc_id, is_test)
+        {
+            for host in &cfg.cfproxy_worker_domains {
+                targets.push(upstream::WsTarget {
+                    key: host.clone(), host: host.clone(),
+                    path: format!("/apiws?dst={}&dc={}&media={}", ip, hs.dc_id, u8::from(hs.is_media)),
+                });
             }
         }
-
-        // Try User CF domains
-        if ws.is_none() {
-            for cf_domain in user_domains {
-                info!("[{}] Fallback User CF Domain: {}", label, cf_domain);
-                let conn = match tokio::time::timeout(ct, RawWebSocket::connect_with_buf(cf_domain, cf_domain, "/apiws", !cfg.disable_secure, io_buf)).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("[{}] Fallback User CF Domain {} timed out", label, cf_domain);
-                        continue;
-                    }
-                };
-                if let Ok(mut cf_ws) = conn
-                    && cf_ws.send(&relay_init).await.is_ok()
-                {
-                    stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ws = Some(cf_ws);
-                    break;
-                }
-            }
+        if cfg.cfproxy_user_domain_enabled {
+            targets.extend(cfg.cfproxy_user_domains.iter().map(|host| upstream::WsTarget {
+                key: host.clone(), host: host.clone(), path: "/apiws".into(),
+            }));
         }
-
-        // Try Dynamic Balancer Domains
-        if ws.is_none() {
-            let balancer_domains = balancer.get_domains_for_dc(dc_id).await;
-            for b_domain in balancer_domains {
-                let host = format!("kws{}.{}", dc_id, b_domain);
-                info!("[{}] Fallback Balancer Domain: {}", label, host);
-                let conn = match tokio::time::timeout(ct, RawWebSocket::connect_with_buf(&host, &host, "/apiws", !cfg.disable_secure, io_buf)).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("[{}] Fallback Balancer Domain {} timed out", label, host);
-                        balancer.record_failure(&b_domain).await;
-                        continue;
-                    }
-                };
-
-                if let Ok(mut b_ws) = conn {
-                    if b_ws.send(&relay_init).await.is_ok() {
-                        stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ws = Some(b_ws);
-                        break;
-                    }
-                } else {
-                    balancer.rotate_domain_for_dc(dc_id).await;
-                }
-            }
+        targets.extend(balancer.get_domains_for_dc(dc_id).await.into_iter().map(|key| {
+            upstream::WsTarget { host: format!("kws{}.{}", dc_id, key), key, path: "/apiws".into() }
+        }));
+        if let Some((host, socket)) = upstream::race_ws(targets, &cfg, relay_init, balancer.clone()).await {
+            stats.record_dc_route(dc_id, "ok", format!("CF {}", host));
+            stats.connections_cfproxy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ws = Some(socket);
         }
     }
 

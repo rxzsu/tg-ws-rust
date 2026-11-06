@@ -102,7 +102,9 @@ watch(logLines, async () => {
 
 onMounted(() => {
   fetchLogs(true);
-  pollTimer = window.setInterval(() => fetchLogs(false), 2000);
+  pollTimer = window.setInterval(() => {
+    if (!document.hidden) void fetchLogs(false);
+  }, 2000);
 });
 
 onUnmounted(() => {

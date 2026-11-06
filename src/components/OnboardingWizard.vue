@@ -13,6 +13,7 @@ import {
 import BaseModal from "./ui/BaseModal.vue";
 import TgLinkCard from "./TgLinkCard.vue";
 import { useProxy, saveSettings } from "../composables/useProxy";
+import { pushToast } from "../composables/useToast";
 import { formatInvokeError } from "../utils/format";
 
 const props = defineProps<{

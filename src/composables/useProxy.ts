@@ -271,8 +271,51 @@ export async function initProxy(): Promise<boolean> {
   if (initialized) return false;
   initialized = true;
 
+  // Re-listen after HMR (module reload resets `initialized`): drop the old
+  // subscription first so telemetry handlers never stack up.
+  unlistenTelemetry?.();
+  unlistenTelemetry = await listen<TelemetrySnapshot>(
+    "telemetry-update",
+    (event) => {
+      const payload = event.payload;
+      if (!isRunning.value) {
+        payload.connections_active = 0;
+        payload.speed_up_kbps = 0;
+        payload.speed_down_kbps = 0;
+      }
+      telemetry.value = payload;
+      speedHistoryUp.value.push(payload.speed_up_kbps);
+      speedHistoryDown.value.push(payload.speed_down_kbps);
+      if (speedHistoryUp.value.length > MAX_HISTORY)
+        speedHistoryUp.value.shift();
+      if (speedHistoryDown.value.length > MAX_HISTORY)
+        speedHistoryDown.value.shift();
+    },
+  );
+
+  // Authoritative bridge state pushed by the backend on every transition:
+  // start/stop from this UI, the tray menu, the Android QS tile, autostart,
+  // and the bridge task exiting on its own. Without it, `isRunning` here went
+  // stale the moment anything but this window touched the bridge.
+  let bridgeRevision = 0;
+  unlistenBridgeState?.();
+  unlistenBridgeState = await listen<boolean>(
+    "bridge-state-changed",
+    (event) => {
+      bridgeRevision++;
+      isRunning.value = event.payload;
+      if (!event.payload) {
+        telemetry.value.connections_active = 0;
+        telemetry.value.speed_up_kbps = 0;
+        telemetry.value.speed_down_kbps = 0;
+      }
+    },
+  );
+
   try {
-    isRunning.value = await invoke<boolean>("is_running");
+    const statusRevision = bridgeRevision;
+    const running = await invoke<boolean>("is_running");
+    if (bridgeRevision === statusRevision) isRunning.value = running;
     const cfg = await invoke<ProxyConfig>("get_config");
     config.value = cfg;
     await updateTgLink(cfg);
@@ -301,45 +344,6 @@ export async function initProxy(): Promise<boolean> {
       8000,
     );
   }
-
-  // Re-listen after HMR (module reload resets `initialized`): drop the old
-  // subscription first so telemetry handlers never stack up.
-  unlistenTelemetry?.();
-  unlistenTelemetry = await listen<TelemetrySnapshot>(
-    "telemetry-update",
-    (event) => {
-      const payload = event.payload;
-      if (!isRunning.value) {
-        payload.connections_active = 0;
-        payload.speed_up_kbps = 0;
-        payload.speed_down_kbps = 0;
-      }
-      telemetry.value = payload;
-      speedHistoryUp.value.push(payload.speed_up_kbps);
-      speedHistoryDown.value.push(payload.speed_down_kbps);
-      if (speedHistoryUp.value.length > MAX_HISTORY)
-        speedHistoryUp.value.shift();
-      if (speedHistoryDown.value.length > MAX_HISTORY)
-        speedHistoryDown.value.shift();
-    },
-  );
-
-  // Authoritative bridge state pushed by the backend on every transition:
-  // start/stop from this UI, the tray menu, the Android QS tile, autostart,
-  // and the bridge task exiting on its own. Without it, `isRunning` here went
-  // stale the moment anything but this window touched the bridge.
-  unlistenBridgeState?.();
-  unlistenBridgeState = await listen<boolean>(
-    "bridge-state-changed",
-    (event) => {
-      isRunning.value = event.payload;
-      if (!event.payload) {
-        telemetry.value.connections_active = 0;
-        telemetry.value.speed_up_kbps = 0;
-        telemetry.value.speed_down_kbps = 0;
-      }
-    },
-  );
 
   checkForUpdates(false);
 
@@ -424,10 +428,14 @@ export async function clearLastError() {
 }
 
 /** Persist settings; returns false when the backend rejected them. */
+let savingSettings = false;
 export async function saveSettings(): Promise<boolean> {
+  if (savingSettings) return false;
+  savingSettings = true;
   try {
-    await invoke("save_config", { newConfig: config.value });
-    await updateTgLink(config.value);
+    const submitted = JSON.parse(JSON.stringify(config.value)) as ProxyConfig;
+    await invoke("save_config", { newConfig: submitted });
+    await updateTgLink(submitted);
     isRunning.value = await invoke<boolean>("is_running");
     pushToast("Настройки применены и сохранены!");
     return true;
@@ -440,6 +448,8 @@ export async function saveSettings(): Promise<boolean> {
     }
     pushToast(formatInvokeError(err), "error", 7000);
     return false;
+  } finally {
+    savingSettings = false;
   }
 }
 

@@ -56,8 +56,8 @@ jobs:
         run: cargo test -p tg-ws-proxy-core --locked
         working-directory: src-tauri
 
-      # The frontend gate: formatter, native typechecker (TS layer — the
-      # Rust<->TS config/telemetry contract lives there), then the build.
+      # The frontend gate: formatter, Vue SFC/template checks and native
+      # TypeScript checks, then the build.
       - name: Frontend fmt + typecheck + build
         run: bun install --frozen-lockfile && bun run fmt:check && bun run build
 

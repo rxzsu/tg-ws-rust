@@ -9,6 +9,8 @@ use tg_ws_proxy_core::config::{PROTO_ABRIDGED_INT, PROTO_TAG_ABRIDGED};
 use tg_ws_proxy_core::crypto::CryptoCtx;
 use tg_ws_proxy_core::handshake::generate_relay_init;
 use tg_ws_proxy_core::splitter::MsgSplitter;
+use tg_ws_proxy_core::bufpool::BufferPool;
+use std::sync::Arc;
 
 fn bench_ctx() -> CryptoCtx {
     let prekey_iv = [0xABu8; 48];
@@ -78,5 +80,28 @@ fn ctx_setup(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, reencrypt, splitter, ctx_setup);
+/// Model a received WS frame shrinking a previously large buffer. This is
+/// the case that used to discard reusable capacity and allocate on reconnect.
+fn buffer_reuse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("buffer_reuse");
+    for size in [65536usize, 262144] {
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_function(format!("fresh_{size}"), |b| b.iter(|| {
+            let mut buf = vec![0u8; size];
+            black_box(&mut buf[..]);
+            buf.truncate(128);
+            black_box(buf);
+        }));
+        let pool = Arc::new(BufferPool::new());
+        group.bench_function(format!("recycled_{size}"), |b| b.iter(|| {
+            let mut buf = pool.acquire(size);
+            black_box(&mut buf[..]);
+            buf.truncate(128);
+            black_box(buf);
+        }));
+    }
+    group.finish();
+}
+
+criterion_group!(benches, reencrypt, splitter, ctx_setup, buffer_reuse);
 criterion_main!(benches);

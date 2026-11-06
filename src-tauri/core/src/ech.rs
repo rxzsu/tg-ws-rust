@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls::ClientConfig;
@@ -112,14 +112,17 @@ pub async fn tls_config_for(domain: &str) -> Option<EchClientConfig> {
 /// `ech` SvcParam. Queries go to well-known resolvers by IP (SNI kept for
 /// certificate validity), so no system resolver is involved.
 async fn fetch_ech_config(domain: &str) -> Result<Vec<u8>, String> {
-    for (ip, sni) in [("1.1.1.1", "cloudflare-dns.com"), ("8.8.8.8", "dns.google")] {
-        match doh_query(ip, sni, domain).await {
-            Ok(list) if !list.is_empty() => return Ok(list),
-            Ok(_) => continue,
-            Err(e) => tracing::debug!("DoH {} ({}) failed: {}", ip, sni, e),
+    let attempts = [("1.1.1.1", "cloudflare-dns.com"), ("8.8.8.8", "dns.google")].map(|(ip, sni)| {
+        let domain = domain.to_owned();
+        async move {
+            match doh_query(ip, sni, &domain).await {
+                Ok(list) if !list.is_empty() => Some(list),
+                _ => None,
+            }
         }
-    }
-    Err("all DoH resolvers failed".into())
+    });
+    crate::upstream::race(attempts, 2, DOH_TIMEOUT).await
+        .ok_or_else(|| "all DoH resolvers failed or timed out".into())
 }
 
 async fn doh_query(ip: &str, sni: &str, domain: &str) -> Result<Vec<u8>, String> {
@@ -162,16 +165,8 @@ async fn doh_query(ip: &str, sni: &str, domain: &str) -> Result<Vec<u8>, String>
     tls.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
     tls.flush().await.map_err(|e| e.to_string())?;
 
-    let mut resp = Vec::new();
-    // Bounded read; the body is parsed through the shared mini-HTTP parser so
-    // a chunked DoH answer (Cloudflare does this) lands in the JSON extractor
-    // decoded, not with hex sizes inline.
-    tokio::time::timeout(DOH_TIMEOUT, tls.read_to_end(&mut resp))
-        .await
-        .map_err(|_| "read timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-
-    let parsed = crate::mini_http::parse_response(&resp, 256 * 1024)?;
+    let parsed = crate::mini_http::read_response(&mut tls, 256 * 1024)
+        .await.map_err(|e| e.to_string())?;
     if parsed.status != 200 {
         return Err(format!("DoH resolver returned HTTP {}", parsed.status));
     }

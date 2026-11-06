@@ -4,8 +4,6 @@ import {
   RefreshCw,
   Wifi,
   Zap,
-  Scale,
-  EyeOff,
   Cable,
   Globe,
   ShieldCheck,

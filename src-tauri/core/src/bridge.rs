@@ -47,6 +47,7 @@ pub async fn bridge_ws_reencrypt(
     activity: ActivityStamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws_reader, mut ws_writer, ws_ponger) = ws.split();
+    let heartbeat = ws_ponger.clone();
     // Single allocation sized from config instead of a hardcoded 64 KB.
     let buf_size = crate::net::clamp_io_buf(opts.io_buf);
     let mut splitter = opts.splitter;
@@ -154,6 +155,11 @@ pub async fn bridge_ws_reencrypt(
     tokio::select! {
         _ = upload_task => {},
         _ = download_task => {},
+        result = heartbeat.keep_alive() => {
+            if let Err(error) = result {
+                tracing::warn!("[{}] upstream liveness check failed: {}", label, error);
+            }
+        },
     }
 
     info!("[{}] bridge session finished", label);

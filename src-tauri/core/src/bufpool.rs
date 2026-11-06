@@ -10,7 +10,7 @@
 //! buffer of at least the requested capacity or allocates a new one;
 //! `release` returns it to the pool (oversized buffers are dropped, so
 //! the pool never holds more than one max-size tier). The freelist is a
-//! lock-free `Mutex<Vec>` — hold times are a pointer swap.
+//! short-lived `Mutex<Vec>` — hold times are a pointer swap.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -40,21 +40,20 @@ impl BufferPool {
     /// Takes `self` by `Arc` so the returned `PooledBuf` can keep the pool
     /// alive without any raw pointers.
     pub fn acquire(self: &Arc<Self>, cap: usize) -> PooledBuf {
-        let buf = self
+        let mut buf = self
             .free
             .lock()
             .ok()
-            .and_then(|mut v| {
-                // Pop the most recently returned buffer (LIFO = hot in cache).
-                while let Some(b) = v.pop() {
-                    if b.len() >= cap {
-                        return Some(b);
-                    }
-                    // Too small for the current tier — drop it.
-                }
-                None
+            .and_then(|mut free| {
+                // recv_into() clears/truncates the Vec, but its allocation is
+                // still reusable. Keep smaller tiers for their next user.
+                let index = free.iter().rposition(|b| b.capacity() >= cap)?;
+                Some(free.swap_remove(index))
             })
-            .unwrap_or_else(|| vec![0u8; cap]);
+            .unwrap_or_else(|| Vec::with_capacity(cap));
+        // Reads must use the configured length, even if a larger tier was
+        // recycled. resize initializes any newly exposed bytes safely.
+        buf.resize(cap, 0);
         PooledBuf { buf: Some(buf), pool: Arc::clone(self) }
     }
 
@@ -114,6 +113,41 @@ impl Drop for PooledBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_receive_buffer_reuses_its_allocation() {
+        let pool = Arc::new(BufferPool::new());
+        let mut buf = pool.acquire(65536);
+        let allocation = buf.as_ptr();
+        buf.clear();
+        drop(buf);
+        let recycled = pool.acquire(65536);
+        assert_eq!(recycled.as_ptr(), allocation);
+        assert_eq!(recycled.len(), 65536);
+    }
+
+    #[test]
+    fn large_request_preserves_smaller_cached_tier() {
+        let pool = Arc::new(BufferPool::new());
+        let small = pool.acquire(4096);
+        let allocation = small.as_ptr();
+        drop(small);
+        let large = pool.acquire(65536);
+        let small = pool.acquire(4096);
+        assert_eq!(small.as_ptr(), allocation);
+        assert_eq!(large.len(), 65536);
+    }
+
+    #[test]
+    fn larger_recycled_buffer_respects_requested_read_size() {
+        let pool = Arc::new(BufferPool::new());
+        let big = pool.acquire(65536);
+        let allocation = big.as_ptr();
+        drop(big);
+        let small = pool.acquire(4096);
+        assert_eq!(small.as_ptr(), allocation);
+        assert_eq!(small.len(), 4096);
+    }
 
     #[test]
     fn reuse_after_release() {

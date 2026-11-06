@@ -63,9 +63,6 @@ const {
 const unlisteners: Array<() => void> = [];
 
 onMounted(async () => {
-  const firstRun = await initProxy();
-  showWizard.value = firstRun;
-
   unlisteners.push(
     await listen<string>("proxy-error", (event) => {
       console.error("Proxy error:", event.payload);
@@ -78,6 +75,7 @@ onMounted(async () => {
       activeTab.value = "settings";
     }),
   );
+  showWizard.value = await initProxy();
 });
 
 onUnmounted(() => {

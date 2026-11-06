@@ -366,9 +366,15 @@ async fn save_config(
         return Err(msg);
     }
 
+    // Serialize persistence, in-memory state and restart as one transaction.
+    let _lifecycle = state.lifecycle.lock().await;
+    let unchanged = *state.config.lock().await == new_config;
+
     // Persist first: if the disk write fails the user must not be told the
     // settings were applied. The bridge keeps running with the old config.
     persist_config(&app, &new_config)?;
+    // Still persist on first run; an unchanged config only skips the restart.
+    if unchanged { return Ok(()); }
     {
         let mut cfg = state.config.lock().await;
         *cfg = new_config.clone();
@@ -379,7 +385,6 @@ async fn save_config(
     // the proxy is stopped used to silently start it.
     // The lifecycle lock covers the whole stop→start sequence so a concurrent
     // start_proxy/tile-toggle cannot interleave with the restart.
-    let _lifecycle = state.lifecycle.lock().await;
     let was_running = state.running.load(Ordering::SeqCst);
     if !was_running {
         return Ok(());
@@ -800,21 +805,11 @@ async fn check_updates() -> Result<UpdateCheckResult, String> {
         }
         Ok(Err(e)) => {
             log::warn!("GitHub update check failed: {:?}", e);
-            Ok(UpdateCheckResult {
-                has_update: false,
-                current_version: current_version.clone(),
-                latest_version: current_version,
-                release_url: "https://github.com/rxzsu/tg-ws-rust/releases".to_string(),
-            })
+            Err(format!("Не удалось проверить обновления: {e}"))
         }
         Err(_) => {
             log::warn!("GitHub update check timed out");
-            Ok(UpdateCheckResult {
-                has_update: false,
-                current_version: current_version.clone(),
-                latest_version: current_version,
-                release_url: "https://github.com/rxzsu/tg-ws-rust/releases".to_string(),
-            })
+            Err("Проверка обновлений превысила таймаут (25 с)".into())
         }
     }
 }

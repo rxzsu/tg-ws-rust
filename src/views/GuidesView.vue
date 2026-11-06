@@ -54,7 +54,7 @@ const guides = computed<Guide[]>(() => [
     title: "Fake TLS / SNI (обход DPI)",
     steps: [
       "DPI часто детектит MTProto-пакеты по сигнатуре.",
-      `Поле «SNI маскирующий домен» сейчас: ${config.fake_tls_domain || "(пусто)"}.`,
+      `Поле «SNI маскирующий домен» сейчас: ${config.value.fake_tls_domain || "(пусто)"}.`,
       "Укажите домен вроде cloudflare.com, yandex.ru, google.com — трафик будет замаскирован под TLS-рукопожатие к этому сайту.",
       "В ссылке появится префикс ee — клиент поймёт, что включён Fake TLS.",
       "Без SNI секрет помечается dd (обычный MTProto).",
@@ -115,7 +115,6 @@ const guides = computed<Guide[]>(() => [
 ]);
 
 const issuesUrl = "https://github.com/rxzsu/tg-ws-rust/issues";
-const repoUrl = "https://github.com/rxzsu/tg-ws-rust";
 
 async function openIssues() {
   try {
